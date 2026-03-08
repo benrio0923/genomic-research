@@ -50,6 +50,12 @@ MODEL_ARCHITECTURES = {
         "pros": "Conv captures local patterns, Transformer adds global context",
         "cons": "More complex architecture, slightly more parameters",
     },
+    "perceiver": {
+        "description": "Perceiver-style (cross-attention latents)",
+        "params": "d_model, n_heads, d_ff, n_layers, n_latents",
+        "pros": "Sub-quadratic O(n*m), great for very long sequences",
+        "cons": "Latent bottleneck may limit per-token prediction quality",
+    },
 }
 
 

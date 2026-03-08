@@ -110,6 +110,8 @@ NORM_POSITION = _cfg("norm_position", "pre")       # "pre" (Pre-LN, default) or 
 USE_MOE = _cfg("use_moe", False)                   # replace FF layers with Mixture of Experts
 N_EXPERTS = _cfg("n_experts", 4)                   # number of expert FF networks
 MOE_TOP_K = _cfg("moe_top_k", 2)                  # top-k routing (how many experts per token)
+ATTENTION_WINDOW = _cfg("attention_window", 0)       # sliding window size (0 = full attention)
+N_GLOBAL_TOKENS = _cfg("n_global_tokens", 1)          # number of global tokens (first N positions)
 MAMBA_D_STATE = _cfg("mamba_d_state", 16)
 MAMBA_D_CONV = _cfg("mamba_d_conv", 4)
 MAMBA_EXPAND = _cfg("mamba_expand", 2)
@@ -150,6 +152,8 @@ USE_MIXUP = _cfg("use_mixup", False)                     # mixup augmentation fo
 MIXUP_ALPHA = _cfg("mixup_alpha", 0.2)                   # Beta distribution alpha for mixup
 USE_CUTMIX = _cfg("use_cutmix", False)                   # CutMix augmentation for classify/regress
 CUTMIX_ALPHA = _cfg("cutmix_alpha", 1.0)                 # Beta distribution alpha for CutMix
+USE_CURRICULUM = _cfg("use_curriculum", False)            # curriculum learning: start short, increase length
+CURRICULUM_START_RATIO = _cfg("curriculum_start_ratio", 0.25)  # start at 25% of max_length
 
 # ---------------------------------------------------------------------------
 # Data augmentation utilities
@@ -458,6 +462,63 @@ class ALiBiPositionBias(nn.Module):
         return -bias  # negative because closer = higher attention
 
 
+def _sliding_window_mask(seq_len, window_size, n_global=1, device="cpu"):
+    """Create a sliding window attention mask with global tokens.
+
+    Returns a float mask (L, L) where -inf blocks attention and 0.0 allows it.
+    First n_global positions can attend to/from all positions (Longformer-style).
+    """
+    mask = torch.full((seq_len, seq_len), float("-inf"), device=device)
+    for i in range(seq_len):
+        lo = max(0, i - window_size // 2)
+        hi = min(seq_len, i + window_size // 2 + 1)
+        mask[i, lo:hi] = 0.0
+    # Global tokens: first n_global positions attend to all and are attended by all
+    if n_global > 0:
+        mask[:n_global, :] = 0.0
+        mask[:, :n_global] = 0.0
+    return mask
+
+
+class T5RelativePositionBias(nn.Module):
+    """T5-style relative position bias with logarithmic bucketing."""
+
+    def __init__(self, n_heads, max_distance=128, n_buckets=32):
+        super().__init__()
+        self.n_heads = n_heads
+        self.n_buckets = n_buckets
+        self.max_distance = max_distance
+        self.relative_attention_bias = nn.Embedding(n_buckets, n_heads)
+
+    @staticmethod
+    def _relative_position_bucket(relative_position, n_buckets=32, max_distance=128):
+        # Bidirectional: half buckets for negative, half for positive
+        n_buckets //= 2
+        rel_buckets = (relative_position > 0).long() * n_buckets
+        rel_pos = relative_position.abs()
+        # First half: exact positions
+        max_exact = n_buckets // 2
+        is_small = rel_pos < max_exact
+        # Second half: logarithmic bucketing
+        rel_pos_if_large = max_exact + (
+            torch.log(rel_pos.float() / max_exact)
+            / math.log(max_distance / max_exact)
+            * (n_buckets - max_exact)
+        ).long()
+        rel_pos_if_large = torch.clamp(rel_pos_if_large, max=n_buckets - 1)
+        rel_buckets += torch.where(is_small, rel_pos, rel_pos_if_large)
+        return rel_buckets
+
+    def forward(self, seq_len, device):
+        positions = torch.arange(seq_len, device=device)
+        relative_position = positions.unsqueeze(0) - positions.unsqueeze(1)  # (L, L)
+        buckets = self._relative_position_bucket(
+            relative_position, self.n_buckets, self.max_distance
+        )
+        values = self.relative_attention_bias(buckets)  # (L, L, n_heads)
+        return values.permute(2, 0, 1)  # (n_heads, L, L)
+
+
 class FocalLoss(nn.Module):
     """Focal loss for handling class imbalance (Lin et al., 2017)."""
 
@@ -690,11 +751,14 @@ class GenomicTransformer(nn.Module):
     def __init__(self, vocab_size, d_model, n_heads, d_ff, n_layers, max_len, dropout,
                  task_type, n_classes=None, pos_encoding="sinusoidal",
                  stochastic_depth=0.0, use_deepnorm=False, norm_position="pre",
-                 use_moe=False, n_experts=4, moe_top_k=2):
+                 use_moe=False, n_experts=4, moe_top_k=2,
+                 attention_window=0, n_global_tokens=1):
         super().__init__()
         self.task_type = task_type
         self.d_model = d_model
         self.pos_type = pos_encoding
+        self.attention_window = attention_window
+        self.n_global_tokens = n_global_tokens
 
         # DeepNorm: α = (2N)^(1/4), β = (8N)^(-1/4) where N = n_layers
         self._deepnorm_alpha = (2 * n_layers) ** 0.25 if use_deepnorm else 1.0
@@ -709,14 +773,16 @@ class GenomicTransformer(nn.Module):
             self.pos_encoding = nn.Embedding(max_len, d_model)
             self.pos_drop = nn.Dropout(dropout)
             self.use_custom_layers = False
-        elif pos_encoding in ("rotary", "alibi"):
+        elif pos_encoding in ("rotary", "alibi", "relative"):
             self.use_custom_layers = True
             self.emb_dropout = nn.Dropout(dropout)
             if pos_encoding == "rotary":
                 head_dim = d_model // n_heads
                 self.rotary = RotaryEmbedding(head_dim, max_len=max_len)
-            else:
+            elif pos_encoding == "alibi":
                 self.alibi = ALiBiPositionBias(n_heads, max_len=max_len)
+            else:  # relative (T5-style)
+                self.t5_bias = T5RelativePositionBias(n_heads, max_distance=max_len)
         else:
             self.pos_encoding = PositionalEncoding(d_model, max_len=max_len, dropout=dropout)
             self.use_custom_layers = False
@@ -768,12 +834,24 @@ class GenomicTransformer(nn.Module):
             device = input_ids.device
 
             rotary_freqs = self.rotary(L, device) if hasattr(self, 'rotary') else None
-            attn_bias = self.alibi(L, device) if hasattr(self, 'alibi') else None
+            attn_bias = None
+            if hasattr(self, 'alibi'):
+                attn_bias = self.alibi(L, device)
+            elif hasattr(self, 't5_bias'):
+                attn_bias = self.t5_bias(L, device)
 
             key_padding_mask = (attention_mask == 0) if attention_mask is not None else None
             causal_mask = None
             if self.task_type == "pretrain" and hasattr(self, '_use_causal') and self._use_causal:
                 causal_mask = torch.triu(torch.full((L, L), float("-inf"), device=device), diagonal=1)
+
+            # Sliding window attention mask (Longformer-style)
+            if self.attention_window > 0 and self.attention_window < L:
+                sw_mask = _sliding_window_mask(L, self.attention_window, self.n_global_tokens, device)
+                if attn_bias is not None:
+                    attn_bias = attn_bias + sw_mask.unsqueeze(0)  # broadcast over heads
+                else:
+                    attn_bias = sw_mask.unsqueeze(0).expand(self.layers[0].n_heads, -1, -1)
 
             for layer in self.layers:
                 x = layer(x, attn_bias=attn_bias, rotary_freqs=rotary_freqs,
@@ -885,6 +963,105 @@ class GenomicCNN(nn.Module):
                 x = (x * mask_expanded).sum(dim=1) / mask_expanded.sum(dim=1).clamp(min=1)
             else:
                 x = x.mean(dim=1)
+            return self.head(x)
+
+
+# ---------------------------------------------------------------------------
+# Perceiver-style architecture
+# ---------------------------------------------------------------------------
+
+class GenomicPerceiver(nn.Module):
+    """Perceiver-style model: cross-attention from learned latents to input.
+
+    Sub-quadratic complexity: O(n*m) where n=seq_len, m=n_latents (m << n).
+    Good for very long sequences without quadratic attention cost.
+    """
+
+    def __init__(self, vocab_size, d_model, n_heads, d_ff, n_layers, max_len, dropout,
+                 task_type, n_classes=None, n_latents=64):
+        super().__init__()
+        self.task_type = task_type
+        self.d_model = d_model
+
+        self.embedding = nn.Embedding(vocab_size, d_model, padding_idx=PAD_TOKEN_ID)
+        self.pos_encoding = PositionalEncoding(d_model, max_len=max_len, dropout=dropout)
+
+        # Learned latent array (much smaller than sequence length)
+        self.latents = nn.Parameter(torch.randn(1, n_latents, d_model) * 0.02)
+
+        # Cross-attention layers: latents attend to input
+        self.cross_attn_layers = nn.ModuleList()
+        self.cross_norms_q = nn.ModuleList()
+        self.cross_norms_kv = nn.ModuleList()
+        # Self-attention layers: latents attend to each other
+        self.self_attn_layers = nn.ModuleList()
+
+        n_cross = max(1, n_layers // 3)
+        n_self = n_layers - n_cross
+
+        for _ in range(n_cross):
+            self.cross_norms_q.append(nn.LayerNorm(d_model))
+            self.cross_norms_kv.append(nn.LayerNorm(d_model))
+            self.cross_attn_layers.append(
+                nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=True)
+            )
+
+        for _ in range(n_self):
+            self.self_attn_layers.append(nn.TransformerEncoderLayer(
+                d_model=d_model, nhead=n_heads, dim_feedforward=d_ff,
+                dropout=dropout, activation="gelu", batch_first=True, norm_first=True,
+            ))
+
+        self.ln = nn.LayerNorm(d_model)
+
+        if task_type == "pretrain":
+            # Need to project back to sequence length for per-token prediction
+            self.cross_back = nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=True)
+            self.cross_back_norm = nn.LayerNorm(d_model)
+            self.head = nn.Linear(d_model, vocab_size)
+        elif task_type == "classify":
+            self.head = nn.Sequential(
+                nn.Linear(d_model, d_model), nn.GELU(), nn.Dropout(dropout),
+                nn.Linear(d_model, n_classes),
+            )
+        elif task_type == "regress":
+            self.head = nn.Sequential(
+                nn.Linear(d_model, d_model), nn.GELU(), nn.Dropout(dropout),
+                nn.Linear(d_model, 1),
+            )
+
+    def forward(self, input_ids, attention_mask=None):
+        B = input_ids.size(0)
+        x = self.embedding(input_ids)
+        x = self.pos_encoding(x)
+
+        # Expand latents for batch
+        latents = self.latents.expand(B, -1, -1)  # (B, n_latents, D)
+
+        key_padding_mask = (attention_mask == 0) if attention_mask is not None else None
+
+        # Cross-attention: latents query input
+        for norm_q, norm_kv, cross_attn in zip(self.cross_norms_q, self.cross_norms_kv, self.cross_attn_layers):
+            q = norm_q(latents)
+            kv = norm_kv(x)
+            out, _ = cross_attn(q, kv, kv, key_padding_mask=key_padding_mask)
+            latents = latents + out
+
+        # Self-attention on latents
+        for sa_layer in self.self_attn_layers:
+            latents = sa_layer(latents)
+
+        latents = self.ln(latents)
+
+        if self.task_type == "pretrain":
+            # Cross-attend back: input queries latents to get per-token output
+            x_norm = self.cross_back_norm(x)
+            out, _ = self.cross_back(x_norm, latents, latents)
+            x = x + out
+            return self.head(x)
+        else:
+            # Mean pool latents for classification/regression
+            x = latents.mean(dim=1)
             return self.head(x)
 
 
@@ -1172,6 +1349,7 @@ def build_model(model_type, vocab_size, d_model, n_heads, d_ff, n_layers,
             use_deepnorm=USE_DEEPNORM,
             norm_position=NORM_POSITION,
             use_moe=USE_MOE, n_experts=N_EXPERTS, moe_top_k=MOE_TOP_K,
+            attention_window=ATTENTION_WINDOW, n_global_tokens=N_GLOBAL_TOKENS,
         )
     elif model_type == "cnn":
         model = GenomicCNN(
@@ -1193,6 +1371,13 @@ def build_model(model_type, vocab_size, d_model, n_heads, d_ff, n_layers,
             n_layers=n_layers, max_len=max_len, dropout=dropout,
             task_type=task_type, n_classes=n_classes,
         )
+    elif model_type == "perceiver":
+        n_latents = kwargs.get("n_latents", 64)
+        model = GenomicPerceiver(
+            vocab_size=vocab_size, d_model=d_model, n_heads=n_heads, d_ff=d_ff,
+            n_layers=n_layers, max_len=max_len, dropout=dropout,
+            task_type=task_type, n_classes=n_classes, n_latents=n_latents,
+        )
     elif model_type == "mamba":
         model = GenomicMamba(
             vocab_size=vocab_size, d_model=d_model, n_layers=n_layers, d_ff=d_ff,
@@ -1201,7 +1386,7 @@ def build_model(model_type, vocab_size, d_model, n_heads, d_ff, n_layers,
             expand=MAMBA_EXPAND,
         )
     else:
-        raise ValueError(f"Unknown model type: {model_type}. Use: transformer, cnn, lstm, gru, conv_transformer, mamba")
+        raise ValueError(f"Unknown model type: {model_type}. Use: transformer, cnn, lstm, gru, conv_transformer, perceiver, mamba")
 
     # Apply proper weight initialization
     model.apply(lambda m: _init_weights(m, d_model))
@@ -1582,11 +1767,21 @@ if __name__ == "__main__":
             t0 = time.time()
 
             try:
+                # Curriculum learning: linearly increase effective sequence length
+                _curriculum_len = None
+                if USE_CURRICULUM:
+                    elapsed_frac = (time.time() - t_start_training) / TIME_BUDGET
+                    curr_ratio = CURRICULUM_START_RATIO + (1.0 - CURRICULUM_START_RATIO) * min(elapsed_frac, 1.0)
+                    _curriculum_len = max(16, int(max_length * curr_ratio))
+
                 if task_type in ("classify", "regress"):
                     tokens_batch, mask_batch, labels_batch = batch
                     tokens_batch = tokens_batch.to(device)
                     mask_batch = mask_batch.to(device)
                     labels_batch = labels_batch.to(device)
+                    if _curriculum_len and _curriculum_len < tokens_batch.size(1):
+                        tokens_batch = tokens_batch[:, :_curriculum_len]
+                        mask_batch = mask_batch[:, :_curriculum_len]
 
                     # Data augmentation for classify/regress
                     if USE_SNP_NOISE and SNP_RATE > 0:
@@ -1621,6 +1816,9 @@ if __name__ == "__main__":
                     tokens_batch, mask_batch = batch
                     tokens_batch = tokens_batch.to(device)
                     mask_batch = mask_batch.to(device)
+                    if _curriculum_len and _curriculum_len < tokens_batch.size(1):
+                        tokens_batch = tokens_batch[:, :_curriculum_len]
+                        mask_batch = mask_batch[:, :_curriculum_len]
 
                     # Reverse complement augmentation (50% chance per batch)
                     if USE_RC_AUGMENT and torch.rand(1).item() < 0.5:
