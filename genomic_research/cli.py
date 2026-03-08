@@ -1678,6 +1678,93 @@ def cmd_archive(args):
         print(f"    {f}")
 
 
+def cmd_push(args):
+    """Push model to HuggingFace Hub (T141)."""
+    try:
+        from huggingface_hub import HfApi, create_repo
+    except ImportError:
+        print("Error: huggingface_hub required. Install with: pip install huggingface-hub")
+        sys.exit(1)
+
+    import torch
+
+    checkpoint = args.checkpoint
+    if not os.path.exists(checkpoint):
+        print(f"Error: Checkpoint not found: {checkpoint}")
+        sys.exit(1)
+
+    repo_id = args.repo
+    if not repo_id:
+        print("Error: --repo is required (e.g., username/genomic-model)")
+        sys.exit(1)
+
+    # Load checkpoint to get config
+    ckpt = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    config = ckpt.get("model_config", {})
+
+    # Create repo if needed
+    api = HfApi()
+    try:
+        create_repo(repo_id, exist_ok=True, private=args.private)
+    except Exception as e:
+        print(f"Warning: Could not create repo: {e}")
+
+    # Upload checkpoint
+    api.upload_file(
+        path_or_fileobj=checkpoint,
+        path_in_repo="model.pt",
+        repo_id=repo_id,
+    )
+
+    # Generate and upload model card
+    card_content = f"""---
+tags:
+  - genomics
+  - foundation-model
+  - pytorch
+library_name: genomic-research
+---
+
+# {repo_id.split('/')[-1]}
+
+Trained with [genomic-research](https://github.com/benrio0923/genomic-research).
+
+## Model Details
+- **Architecture**: {config.get('model_type', 'unknown')}
+- **Task**: {config.get('task_type', 'unknown')}
+- **Parameters**: {config.get('num_params', 'unknown')}
+- **d_model**: {config.get('d_model', 'unknown')}
+"""
+    card_path = "/tmp/_model_card.md"
+    with open(card_path, "w") as f:
+        f.write(card_content)
+
+    api.upload_file(
+        path_or_fileobj=card_path,
+        path_in_repo="README.md",
+        repo_id=repo_id,
+    )
+
+    print(f"Model pushed to https://huggingface.co/{repo_id}")
+
+
+def cmd_pull(args):
+    """Pull model from HuggingFace Hub (T141)."""
+    try:
+        from huggingface_hub import hf_hub_download
+    except ImportError:
+        print("Error: huggingface_hub required. Install with: pip install huggingface-hub")
+        sys.exit(1)
+
+    repo_id = args.repo
+    output = args.output or "model.pt"
+
+    path = hf_hub_download(repo_id=repo_id, filename="model.pt", local_dir=".")
+    if path != output:
+        shutil.copy2(path, output)
+    print(f"Model downloaded to {output}")
+
+
 def cmd_serve(args):
     """Start FastAPI inference server (T139)."""
     from genomic_research.serve import run_server
@@ -1871,6 +1958,20 @@ def main():
     p_demo.add_argument("--port", type=int, default=7860, help="Server port (default: 7860)")
     p_demo.add_argument("--share", action="store_true", help="Create public Gradio link")
 
+    # push (T141)
+    p_push = subparsers.add_parser("push", help="Push model to HuggingFace Hub")
+    p_push.add_argument("--checkpoint", type=str, default="checkpoints/best_model.pt",
+                        help="Path to model checkpoint")
+    p_push.add_argument("--repo", type=str, required=True,
+                        help="HuggingFace repo ID (e.g., username/model-name)")
+    p_push.add_argument("--private", action="store_true", help="Create private repo")
+
+    # pull (T141)
+    p_pull = subparsers.add_parser("pull", help="Pull model from HuggingFace Hub")
+    p_pull.add_argument("--repo", type=str, required=True,
+                        help="HuggingFace repo ID (e.g., username/model-name)")
+    p_pull.add_argument("--output", type=str, default=None, help="Output path (default: model.pt)")
+
     args = parser.parse_args()
 
     if args.command == "init":
@@ -1925,6 +2026,10 @@ def main():
         cmd_serve(args)
     elif args.command == "demo":
         cmd_demo(args)
+    elif args.command == "push":
+        cmd_push(args)
+    elif args.command == "pull":
+        cmd_pull(args)
     else:
         parser.print_help()
 

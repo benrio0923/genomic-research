@@ -139,6 +139,7 @@ USE_CPU_OFFLOAD = _cfg("use_cpu_offload", False)          # T174: offload optimi
 NUM_WORKERS = 0                # dataloader workers (0 = main process)
 PIN_MEMORY = False             # pin memory for faster CUDA transfer
 USE_DDP = False                # distributed data parallel (multi-GPU)
+USE_FSDP = _cfg("use_fsdp", False)  # T175: Fully Sharded Data Parallel (multi-GPU, memory efficient)
 SEED = _cfg("seed", 42)       # random seed for reproducibility
 USE_EMA = _cfg("use_ema", False)   # exponential moving average of model weights
 EMA_DECAY = _cfg("ema_decay", 0.999)  # EMA decay factor
@@ -2428,8 +2429,28 @@ if __name__ == "__main__":
         except Exception as e:
             print(f"torch.compile failed ({e}), continuing without compilation")
 
-    # Wrap with DDP
-    if USE_DDP and _ddp_world_size > 1:
+    # Wrap with DDP or FSDP
+    if USE_FSDP and torch.cuda.is_available() and torch.cuda.device_count() > 1:
+        try:
+            from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+            from torch.distributed.fsdp import MixedPrecision
+            import torch.distributed as dist
+            if not dist.is_initialized():
+                dist.init_process_group(backend="nccl")
+            _ddp_rank = dist.get_rank()
+            _ddp_world_size = dist.get_world_size()
+            _is_main_process = _ddp_rank == 0
+            mp_policy = MixedPrecision(
+                param_dtype=torch.float16,
+                reduce_dtype=torch.float16,
+                buffer_dtype=torch.float16,
+            ) if USE_AMP else None
+            model = FSDP(model, mixed_precision=mp_policy)
+            if _is_main_process:
+                print(f"FSDP: {_ddp_world_size} GPUs, sharded")
+        except Exception as e:
+            print(f"FSDP init failed ({e}), falling back to single GPU")
+    elif USE_DDP and _ddp_world_size > 1:
         model = DDP(model, device_ids=[_ddp_rank])
 
     # Gradient checkpointing

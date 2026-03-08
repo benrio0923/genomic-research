@@ -79,27 +79,35 @@ def load_tokenizer(cache_dir=None):
             sys.exit(1)
 
 
-def tokenize_sequences(sequences, tokenizer, max_length):
-    """Tokenize and pad sequences."""
-    all_tokens = []
-    all_masks = []
-
-    for sid, seq in sequences:
+def tokenize_sequences(sequences, tokenizer, max_length, sort_by_length=True):
+    """Tokenize and pad sequences. Sort by length for efficient batching (T176)."""
+    indexed = []
+    for idx, (sid, seq) in enumerate(sequences):
         tokens = tokenizer.encode(seq)
         if len(tokens) > max_length:
             tokens = tokens[:max_length]
+        indexed.append((idx, tokens))
 
+    # Sort by token length to minimize padding waste within batches
+    if sort_by_length:
+        indexed.sort(key=lambda x: len(x[1]))
+
+    sort_order = [i for i, _ in indexed]
+    all_tokens = []
+    all_masks = []
+
+    for _, tokens in indexed:
         mask = [1] * len(tokens)
         pad_len = max_length - len(tokens)
         tokens = tokens + [PAD_TOKEN_ID] * pad_len
         mask = mask + [0] * pad_len
-
         all_tokens.append(tokens)
         all_masks.append(mask)
 
     return (
         torch.tensor(all_tokens, dtype=torch.long),
         torch.tensor(all_masks, dtype=torch.long),
+        sort_order,
     )
 
 
@@ -202,14 +210,20 @@ def main():
     sequences = load_sequences(args.fasta)
     print(f"Loaded {len(sequences)} sequences")
 
-    # Tokenize
+    # Tokenize (sorted by length for efficient batching)
     tokenizer = load_tokenizer()
-    tokens, masks = tokenize_sequences(sequences, tokenizer, max_length)
+    tokens, masks, sort_order = tokenize_sequences(sequences, tokenizer, max_length)
+    # Build reverse index: original position -> sorted position
+    unsort = [0] * len(sort_order)
+    for sorted_idx, orig_idx in enumerate(sort_order):
+        unsort[orig_idx] = sorted_idx
 
     # Extract embeddings
     if args.embeddings:
         print("Extracting embeddings...")
         embeddings = extract_embeddings(model, tokens, masks, device, args.batch_size)
+        # Restore original order
+        embeddings = embeddings[unsort]
         np.save(args.embeddings, embeddings)
         print(f"Embeddings saved to {args.embeddings} (shape: {embeddings.shape})")
         return
@@ -224,13 +238,15 @@ def main():
         target_names = task_config.get("target_names", [])
 
         for i, (sid, _) in enumerate(sequences):
-            label = target_names[preds[i]] if preds[i] < len(target_names) else str(preds[i].item())
-            conf = probs[i, preds[i]].item()
+            si = unsort[i]
+            label = target_names[preds[si]] if preds[si] < len(target_names) else str(preds[si].item())
+            conf = probs[si, preds[si]].item()
             print(f"{sid}\t{label}\t{conf:.4f}")
 
     elif task_type == "regress":
         for i, (sid, _) in enumerate(sequences):
-            print(f"{sid}\t{outputs[i].item():.6f}")
+            si = unsort[i]
+            print(f"{sid}\t{outputs[si].item():.6f}")
 
     else:  # pretrain - show perplexity per sequence
         import math
@@ -238,9 +254,10 @@ def main():
         vocab_size = model_config["vocab_size"]
 
         for i, (sid, _) in enumerate(sequences):
-            logits = outputs[i]  # (L, vocab)
-            target = tokens[i]  # (L,)
-            mask = masks[i]
+            si = unsort[i]
+            logits = outputs[si]  # (L, vocab)
+            target = tokens[si]  # (L,)
+            mask = masks[si]
             valid = (mask == 1) & (target >= NUM_SPECIAL)
             if valid.sum() > 0:
                 loss = criterion(logits[valid], target[valid]).mean().item()
