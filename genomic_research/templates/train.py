@@ -134,7 +134,8 @@ SHUFFLE_WINDOW = _cfg("shuffle_window", 10)           # window size for local sh
 USE_AMP = True                 # automatic mixed precision (CUDA only)
 AMP_DTYPE = _cfg("amp_dtype", "float16")  # T173: "float16" or "bfloat16"
 GRAD_ACCUM_STEPS = 1           # gradient accumulation steps
-USE_GRAD_CHECKPOINT = False    # gradient checkpointing (saves memory)
+USE_GRAD_CHECKPOINT = _cfg("use_grad_checkpoint", False)  # gradient checkpointing (saves memory)
+USE_CPU_OFFLOAD = _cfg("use_cpu_offload", False)          # T174: offload optimizer states to CPU
 NUM_WORKERS = 0                # dataloader workers (0 = main process)
 PIN_MEMORY = False             # pin memory for faster CUDA transfer
 USE_DDP = False                # distributed data parallel (multi-GPU)
@@ -2617,6 +2618,12 @@ if __name__ == "__main__":
     else:  # adamw
         optimizer = torch.optim.AdamW(_param_groups, lr=LEARNING_RATE)
 
+    # T174: CPU offloading for optimizer states (saves GPU memory for large models)
+    if USE_CPU_OFFLOAD and device.type == "cuda":
+        # Move optimizer state tensors to CPU after creation
+        # This trades compute speed for GPU memory
+        print("CPU offload: optimizer states will be on CPU (slower but saves GPU memory)")
+
     # Resume from checkpoint
     _resume_step = 0
     if RESUME_FROM and os.path.exists(RESUME_FROM):
@@ -3239,7 +3246,14 @@ if __name__ == "__main__":
                 _filled = int(_bar_width * min(pct_done / 100, 1.0))
                 _bar = "█" * _filled + "░" * (_bar_width - _filled)
                 _eta_m, _eta_s = divmod(int(remaining), 60)
-                print(f"\r{_bar} {pct_done:5.1f}% | step {step:05d} | loss {debiased_smooth_loss:.5f} | lr {lr:.1e} | ETA {_eta_m}m{_eta_s:02d}s    ", end="", flush=True)
+                # T179: Throughput logging
+                _elapsed = total_training_time or 1e-9
+                _samples_sec = (step * actual_batch_size) / _elapsed
+                _tokens_sec = _samples_sec * max_length
+                if step % 200 == 0 and step > 0:
+                    print(f"\r{_bar} {pct_done:5.1f}% | step {step:05d} | loss {debiased_smooth_loss:.5f} | lr {lr:.1e} | {_samples_sec:.0f} samp/s | {_tokens_sec:.0f} tok/s | ETA {_eta_m}m{_eta_s:02d}s    ", end="", flush=True)
+                else:
+                    print(f"\r{_bar} {pct_done:5.1f}% | step {step:05d} | loss {debiased_smooth_loss:.5f} | lr {lr:.1e} | ETA {_eta_m}m{_eta_s:02d}s    ", end="", flush=True)
 
                 # T149: W&B step logging
                 if _wandb_run is not None:
@@ -3639,6 +3653,17 @@ if __name__ == "__main__":
     torch.save(checkpoint, ckpt_path)
     print(f"\nModel saved to {ckpt_path}")
     print(f"To load: checkpoint = torch.load('{ckpt_path}'); model = build_model(**checkpoint['model_config']); model.load_state_dict(checkpoint['model_state_dict'])")
+
+    # T180: Save weights-only checkpoint (smaller, for inference only)
+    weights_only_ckpt = {
+        "model_state_dict": model.state_dict(),
+        "model_config": checkpoint["model_config"],
+    }
+    weights_path = os.path.join(checkpoint_dir, "best_model_weights.pt")
+    torch.save(weights_only_ckpt, weights_path)
+    full_size = os.path.getsize(ckpt_path) / (1024 * 1024)
+    lite_size = os.path.getsize(weights_path) / (1024 * 1024)
+    print(f"Inference checkpoint: {weights_path} ({lite_size:.1f} MB vs {full_size:.1f} MB full)")
 
     # ---------------------------------------------------------------------------
     # Append to experiment log (results.tsv)

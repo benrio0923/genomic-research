@@ -91,9 +91,47 @@ MODEL_TYPE = "lstm"
 # Moderate for genomics, but slower than alternatives
 ```
 
-### Hybrid
-- Combine architectures (e.g., CNN encoder → Transformer decoder)
-- Local convolutions for motif detection + global attention for long-range
+### Conv-Transformer (hybrid)
+```python
+MODEL_TYPE = "conv_transformer"
+# CNN layers for local patterns + Transformer for global context
+```
+
+### Perceiver (cross-attention latents)
+```python
+MODEL_TYPE = "perceiver"
+# Sub-quadratic O(n*m), good for very long sequences
+```
+
+### RWKV (linear attention)
+```python
+MODEL_TYPE = "rwkv"
+# O(n) linear complexity, efficient inference
+```
+
+### Hyena (long convolution via FFT)
+```python
+MODEL_TYPE = "hyena"
+# HyenaDNA-inspired, sub-quadratic, good for long sequences
+```
+
+### Reformer (LSH attention)
+```python
+MODEL_TYPE = "reformer"
+# O(n log n) approximate attention
+```
+
+### U-Net (encoder-decoder with skip connections)
+```python
+MODEL_TYPE = "unet"
+# Excellent for per-position prediction tasks
+```
+
+### Multi-Scale CNN / Deep Sets
+```python
+MODEL_TYPE = "multiscale_cnn"  # Inception-style multi-kernel CNN
+MODEL_TYPE = "deep_sets"       # Permutation-invariant for metagenomics
+```
 
 ## Pre-training specific guidance
 
@@ -117,7 +155,33 @@ MODEL_TYPE = "lstm"
 4. Try CLM objective
 5. Architecture experiments (CNN, Mamba if CUDA, hybrid)
 6. Advanced: different positional encodings (rotary, ALiBi)
-7. Advanced: mixed precision training
+7. Advanced: mixed precision training (fp16 or bfloat16)
+
+### Advanced experiment strategies
+- **Curriculum learning**: `USE_CURRICULUM = True` — start with short sequences, gradually increase.
+- **Progressive resizing**: `USE_PROGRESSIVE_RESIZE = True` — start at `PROGRESSIVE_START_LEN` tokens, grow to full length.
+- **Knowledge distillation**: Train a large teacher first, then distill with `USE_DISTILLATION = True`.
+- **Multi-objective**: `AUX_LOSSES = ["contrastive", "denoise"]` with `AUX_LOSS_WEIGHT = 0.1`.
+- **Data augmentation**: Enable SNP noise, indel noise, reverse complement, local shuffle.
+- **Regularization**: R-Drop (`USE_RDROP`), SAM optimizer (`USE_SAM`), mixup/cutmix for classification.
+- **Architecture search**: Use `genomic-research hypersearch --trials 20` for Optuna-based search.
+
+### Common failure modes and recovery
+| Symptom | Likely Cause | Fix |
+|---------|-------------|-----|
+| Loss = NaN | Learning rate too high | Reduce LR by 10x, add gradient clipping |
+| Loss doesn't decrease | LR too low or model too small | Increase LR, increase d_model |
+| val_score oscillates | Batch too small or LR too high | Increase batch size, reduce LR |
+| OOM (out of memory) | Model too large | Reduce d_model/n_layers, enable `USE_GRAD_CHECKPOINT`, use AMP |
+| Mamba import fails | No CUDA | Fall back to Transformer/CNN/RWKV |
+| Overfitting (train >> val) | Model too complex for data | Increase dropout, reduce layers, add data augmentation |
+
+### Genomics-specific tips
+- For viral genomes (10-30kb): char tokenizer + Mamba/Hyena works well
+- For bacterial genomes (>1Mb): kmer tokenizer + Transformer, use streaming loader
+- Codon tokenizer (`"codon"`) is best for coding regions when reading frame is known
+- GC content bias: check with `GC_BIAS_ANALYSIS` in reports
+- If sequences are very similar: use `phylogenetic_split()` to prevent data leakage
 
 ## Output format
 
