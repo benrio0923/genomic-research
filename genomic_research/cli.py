@@ -56,6 +56,18 @@ MODEL_ARCHITECTURES = {
         "pros": "Sub-quadratic O(n*m), great for very long sequences",
         "cons": "Latent bottleneck may limit per-token prediction quality",
     },
+    "rwkv": {
+        "description": "RWKV (linear attention with time-decay)",
+        "params": "d_model, d_ff, n_layers",
+        "pros": "O(n) linear complexity, efficient inference",
+        "cons": "May underperform Transformer on short sequences",
+    },
+    "multiscale_cnn": {
+        "description": "Multi-Scale CNN (Inception-style)",
+        "params": "d_model, d_ff, n_layers, kernel_sizes",
+        "pros": "Captures patterns at multiple scales simultaneously",
+        "cons": "More parameters than single-scale CNN",
+    },
 }
 
 

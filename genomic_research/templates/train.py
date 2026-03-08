@@ -160,6 +160,8 @@ USE_SAM = _cfg("use_sam", False)                         # Sharpness-Aware Minim
 SAM_RHO = _cfg("sam_rho", 0.05)                          # SAM perturbation radius
 USE_CONTRASTIVE = _cfg("use_contrastive", False)         # contrastive learning (SimCLR-style)
 CONTRASTIVE_TEMP = _cfg("contrastive_temp", 0.07)        # temperature for InfoNCE loss
+MULTI_LABEL = _cfg("multi_label", False)                 # multi-label classification (sigmoid per class)
+DYNAMIC_BATCH = _cfg("dynamic_batch", False)             # increase batch size over training
 
 # ---------------------------------------------------------------------------
 # Data augmentation utilities
@@ -1337,6 +1339,197 @@ class GenomicLSTM(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# RWKV-style architecture
+# ---------------------------------------------------------------------------
+
+class RWKVBlock(nn.Module):
+    """RWKV block: linear attention with time-decay (pure PyTorch)."""
+
+    def __init__(self, d_model, d_ff, dropout):
+        super().__init__()
+        self.ln1 = nn.LayerNorm(d_model)
+        self.ln2 = nn.LayerNorm(d_model)
+
+        # Time-mixing (linear attention with decay)
+        self.time_decay = nn.Parameter(torch.randn(d_model) * 0.01)
+        self.time_first = nn.Parameter(torch.randn(d_model) * 0.01)
+        self.key = nn.Linear(d_model, d_model, bias=False)
+        self.value = nn.Linear(d_model, d_model, bias=False)
+        self.receptance = nn.Linear(d_model, d_model, bias=False)
+        self.output = nn.Linear(d_model, d_model, bias=False)
+
+        # Channel-mixing (feed-forward)
+        self.ff_key = nn.Linear(d_model, d_ff, bias=False)
+        self.ff_value = nn.Linear(d_ff, d_model, bias=False)
+        self.ff_receptance = nn.Linear(d_model, d_model, bias=False)
+        self.drop = nn.Dropout(dropout)
+
+    def forward(self, x):
+        B, L, D = x.shape
+
+        # Time-mixing
+        h = self.ln1(x)
+        # Token shift: mix current with previous token
+        shifted = torch.cat([torch.zeros(B, 1, D, device=x.device), h[:, :-1]], dim=1)
+        k = self.key(shifted)
+        v = self.value(shifted)
+        r = torch.sigmoid(self.receptance(h))
+
+        # Linear attention with exponential decay (WKV computation)
+        w = -torch.exp(self.time_decay)  # negative = decay
+        u = self.time_first
+        # Approximate WKV via cumulative sum (efficient O(n) implementation)
+        wkv = torch.zeros(B, D, device=x.device)
+        wkv_sum = torch.zeros(B, D, device=x.device)
+        outputs = []
+        for t in range(L):
+            kt = k[:, t]
+            vt = v[:, t]
+            # Compute attention: max(e^{w*prev + k_t}, e^{u + k_t}) for stability
+            ew = torch.exp(w + wkv)
+            eu = torch.exp(u + kt)
+            a = ew * wkv_sum + eu * vt
+            b = ew + eu
+            outputs.append((a / b.clamp(min=1e-8)).unsqueeze(1))
+            # Update state
+            wkv = w + wkv  # decay
+            wkv_sum = torch.exp(w) * wkv_sum + torch.exp(kt) * vt
+            wkv = torch.log(torch.exp(wkv) + torch.exp(kt)).clamp(max=30)  # log-sum-exp
+
+        out = torch.cat(outputs, dim=1)
+        x = x + self.drop(self.output(r * out))
+
+        # Channel-mixing
+        h = self.ln2(x)
+        shifted = torch.cat([torch.zeros(B, 1, D, device=x.device), h[:, :-1]], dim=1)
+        r_ff = torch.sigmoid(self.ff_receptance(h))
+        k_ff = torch.relu(self.ff_key(shifted)) ** 2  # squared ReLU
+        x = x + self.drop(r_ff * self.ff_value(k_ff))
+        return x
+
+
+class GenomicRWKV(nn.Module):
+    """RWKV-style model with O(n) linear attention for genomic sequences."""
+
+    def __init__(self, vocab_size, d_model, n_layers, d_ff, max_len, dropout,
+                 task_type, n_classes=None):
+        super().__init__()
+        self.task_type = task_type
+        self.d_model = d_model
+
+        self.embedding = nn.Embedding(vocab_size, d_model, padding_idx=PAD_TOKEN_ID)
+        self.emb_dropout = nn.Dropout(dropout)
+
+        self.blocks = nn.ModuleList([
+            RWKVBlock(d_model, d_ff, dropout) for _ in range(n_layers)
+        ])
+        self.ln = nn.LayerNorm(d_model)
+
+        if task_type == "pretrain":
+            self.head = nn.Linear(d_model, vocab_size)
+        elif task_type == "classify":
+            self.head = nn.Sequential(
+                nn.Linear(d_model, d_model), nn.GELU(), nn.Dropout(dropout),
+                nn.Linear(d_model, n_classes),
+            )
+        elif task_type == "regress":
+            self.head = nn.Sequential(
+                nn.Linear(d_model, d_model), nn.GELU(), nn.Dropout(dropout),
+                nn.Linear(d_model, 1),
+            )
+
+    def forward(self, input_ids, attention_mask=None):
+        x = self.embedding(input_ids)
+        x = self.emb_dropout(x)
+
+        for block in self.blocks:
+            x = block(x)
+        x = self.ln(x)
+
+        if self.task_type == "pretrain":
+            return self.head(x)
+        else:
+            if attention_mask is not None:
+                m = attention_mask.unsqueeze(-1).float()
+                x = (x * m).sum(dim=1) / m.sum(dim=1).clamp(min=1)
+            else:
+                x = x.mean(dim=1)
+            return self.head(x)
+
+
+# ---------------------------------------------------------------------------
+# Multi-Scale CNN (Inception-style)
+# ---------------------------------------------------------------------------
+
+class GenomicMultiScaleCNN(nn.Module):
+    """Inception-style CNN with parallel conv branches at different kernel sizes."""
+
+    def __init__(self, vocab_size, d_model, n_layers, d_ff, max_len, dropout,
+                 task_type, n_classes=None, kernel_sizes=(3, 7, 15, 31)):
+        super().__init__()
+        self.task_type = task_type
+        self.d_model = d_model
+
+        self.embedding = nn.Embedding(vocab_size, d_model, padding_idx=PAD_TOKEN_ID)
+        self.emb_dropout = nn.Dropout(dropout)
+
+        branch_dim = d_model // len(kernel_sizes)
+        # Ensure total dim = d_model
+        last_dim = d_model - branch_dim * (len(kernel_sizes) - 1)
+
+        # Multi-scale conv blocks (stacked n_layers times)
+        self.layers = nn.ModuleList()
+        for layer_idx in range(n_layers):
+            branches = nn.ModuleList()
+            for i, ks in enumerate(kernel_sizes):
+                out_ch = last_dim if i == len(kernel_sizes) - 1 else branch_dim
+                in_ch = d_model
+                branches.append(nn.Sequential(
+                    nn.Conv1d(in_ch, out_ch, ks, padding=ks // 2),
+                    nn.BatchNorm1d(out_ch),
+                    nn.GELU(),
+                    nn.Dropout(dropout),
+                ))
+            self.layers.append(branches)
+
+        self.ln = nn.LayerNorm(d_model)
+
+        if task_type == "pretrain":
+            self.head = nn.Linear(d_model, vocab_size)
+        elif task_type == "classify":
+            self.head = nn.Sequential(
+                nn.Linear(d_model, d_model), nn.GELU(), nn.Dropout(dropout),
+                nn.Linear(d_model, n_classes),
+            )
+        elif task_type == "regress":
+            self.head = nn.Sequential(
+                nn.Linear(d_model, d_model), nn.GELU(), nn.Dropout(dropout),
+                nn.Linear(d_model, 1),
+            )
+
+    def forward(self, input_ids, attention_mask=None):
+        x = self.embedding(input_ids)  # (B, L, D)
+        x = self.emb_dropout(x)
+
+        h = x.transpose(1, 2)  # (B, D, L)
+        for branches in self.layers:
+            outs = [branch(h) for branch in branches]
+            h = torch.cat(outs, dim=1) + h  # residual
+        x = h.transpose(1, 2)  # (B, L, D)
+        x = self.ln(x)
+
+        if self.task_type == "pretrain":
+            return self.head(x)
+        else:
+            if attention_mask is not None:
+                m = attention_mask.unsqueeze(-1).float()
+                x = (x * m).sum(dim=1) / m.sum(dim=1).clamp(min=1)
+            else:
+                x = x.mean(dim=1)
+            return self.head(x)
+
+
+# ---------------------------------------------------------------------------
 # Mamba Model (requires mamba-ssm, CUDA only)
 # ---------------------------------------------------------------------------
 
@@ -1502,6 +1695,16 @@ def build_model(model_type, vocab_size, d_model, n_heads, d_ff, n_layers,
             n_layers=n_layers, max_len=max_len, dropout=dropout,
             task_type=task_type, n_classes=n_classes, n_latents=n_latents,
         )
+    elif model_type == "rwkv":
+        model = GenomicRWKV(
+            vocab_size=vocab_size, d_model=d_model, n_layers=n_layers, d_ff=d_ff,
+            max_len=max_len, dropout=dropout, task_type=task_type, n_classes=n_classes,
+        )
+    elif model_type == "multiscale_cnn":
+        model = GenomicMultiScaleCNN(
+            vocab_size=vocab_size, d_model=d_model, n_layers=n_layers, d_ff=d_ff,
+            max_len=max_len, dropout=dropout, task_type=task_type, n_classes=n_classes,
+        )
     elif model_type == "mamba":
         model = GenomicMamba(
             vocab_size=vocab_size, d_model=d_model, n_layers=n_layers, d_ff=d_ff,
@@ -1510,7 +1713,7 @@ def build_model(model_type, vocab_size, d_model, n_heads, d_ff, n_layers,
             expand=MAMBA_EXPAND,
         )
     else:
-        raise ValueError(f"Unknown model type: {model_type}. Use: transformer, cnn, lstm, gru, conv_transformer, perceiver, mamba")
+        raise ValueError(f"Unknown model type: {model_type}. Use: transformer, cnn, lstm, gru, conv_transformer, perceiver, rwkv, multiscale_cnn, mamba")
 
     # Apply proper weight initialization
     model.apply(lambda m: _init_weights(m, d_model))
@@ -1769,7 +1972,10 @@ if __name__ == "__main__":
     elif task_type == "classify":
         class_weights = config.get("class_weights")
         _cw = torch.tensor(class_weights, dtype=torch.float32, device=device) if class_weights else None
-        if LOSS_FN == "focal":
+        if MULTI_LABEL:
+            # Multi-label: sigmoid + BCE per class
+            criterion = nn.BCEWithLogitsLoss(weight=_cw)
+        elif LOSS_FN == "focal":
             criterion = FocalLoss(gamma=FOCAL_GAMMA, weight=_cw, label_smoothing=_ls)
         elif _cw is not None:
             criterion = nn.CrossEntropyLoss(weight=_cw, label_smoothing=_ls)
@@ -1893,8 +2099,33 @@ if __name__ == "__main__":
 
     model.train()
 
+    _current_batch_size = actual_batch_size
+
     while True:
         epoch += 1
+
+        # Dynamic batch sizing: increase batch size over training
+        if DYNAMIC_BATCH:
+            elapsed_frac = (time.time() - t_start_training) / TIME_BUDGET
+            target_bs = max(actual_batch_size // 4, 1)  # start at 25% of target
+            new_bs = int(target_bs + (actual_batch_size - target_bs) * min(elapsed_frac, 1.0))
+            new_bs = min(new_bs, actual_batch_size)
+            if new_bs != _current_batch_size:
+                _current_batch_size = new_bs
+                _dl_drop = config["n_train"] > _current_batch_size
+                if task_type in ("classify", "regress"):
+                    train_loader = make_dataloader(
+                        data["train_tokens"], data["train_mask"], _current_batch_size,
+                        shuffle=True, drop_last=_dl_drop, labels=data.get("train_labels"),
+                        num_workers=NUM_WORKERS, pin_memory=_pin,
+                    )
+                else:
+                    train_loader = make_dataloader(
+                        data["train_tokens"], data["train_mask"], _current_batch_size,
+                        shuffle=True, drop_last=_dl_drop,
+                        num_workers=NUM_WORKERS, pin_memory=_pin,
+                    )
+
         for batch in train_loader:
             t0 = time.time()
 
@@ -1933,16 +2164,25 @@ if __name__ == "__main__":
                         if task_type == "regress":
                             output = output.squeeze(-1)
 
+                        # Multi-label: convert integer labels to one-hot for BCE
+                        _labels_for_loss = labels_batch
+                        if MULTI_LABEL and task_type == "classify" and labels_batch.dtype in (torch.long, torch.int):
+                            n_cls = output.size(-1)
+                            _labels_for_loss = torch.zeros(labels_batch.size(0), n_cls, device=device)
+                            _labels_for_loss.scatter_(1, labels_batch.unsqueeze(1), 1.0)
+
                         # Mixup: interpolate output logits (applied after model forward)
                         if USE_MIXUP and MIXUP_ALPHA > 0 and _mixup_lam is None and torch.rand(1).item() < 0.5:
                             perm = torch.randperm(output.size(0), device=device)
                             lam = np.random.beta(MIXUP_ALPHA, MIXUP_ALPHA)
-                            loss = lam * criterion(output, labels_batch) + (1 - lam) * criterion(output, labels_batch[perm])
+                            loss = lam * criterion(output, _labels_for_loss) + (1 - lam) * criterion(output, _labels_for_loss[perm])
                         elif _mixup_lam is not None:
                             # CutMix loss: weighted combination of two labels
-                            loss = _mixup_lam * criterion(output, labels_a) + (1 - _mixup_lam) * criterion(output, labels_b)
+                            _la = labels_a if not MULTI_LABEL else _labels_for_loss
+                            _lb = labels_b if not MULTI_LABEL else _labels_for_loss
+                            loss = _mixup_lam * criterion(output, _la) + (1 - _mixup_lam) * criterion(output, _lb)
                         else:
-                            loss = criterion(output, labels_batch)
+                            loss = criterion(output, _labels_for_loss)
 
                 else:  # pretrain
                     tokens_batch, mask_batch = batch
