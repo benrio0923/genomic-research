@@ -105,6 +105,7 @@ LSTM_BIDIRECTIONAL = _cfg("lstm_bidirectional", True)
 RNN_TYPE = _cfg("rnn_type", "lstm")                # lstm or gru
 CNN_DILATION = _cfg("cnn_dilation", False)          # use exponential dilation in CNN
 STOCHASTIC_DEPTH = _cfg("stochastic_depth", 0.0)   # layer drop probability (0.0 = disabled)
+USE_DEEPNORM = _cfg("use_deepnorm", False)         # DeepNorm for stable deep training
 MAMBA_D_STATE = _cfg("mamba_d_state", 16)
 MAMBA_D_CONV = _cfg("mamba_d_conv", 4)
 MAMBA_EXPAND = _cfg("mamba_expand", 2)
@@ -120,6 +121,8 @@ INDEL_RATE = _cfg("indel_rate", 0.005)            # fraction of tokens for indel
 USE_RANDOM_CROP = _cfg("use_random_crop", False)  # random subsequence cropping
 MIN_CROP_RATIO = _cfg("min_crop_ratio", 0.5)      # minimum crop length ratio
 TOKEN_DROPOUT = _cfg("token_dropout", 0.0)         # randomly drop tokens (replace with PAD)
+USE_LOCAL_SHUFFLE = _cfg("use_local_shuffle", False)  # shuffle within k-bp windows
+SHUFFLE_WINDOW = _cfg("shuffle_window", 10)           # window size for local shuffling
 
 # --- Training infrastructure ---
 USE_AMP = True                 # automatic mixed precision (CUDA only)
@@ -137,6 +140,8 @@ USE_SWA = _cfg("use_swa", False)   # stochastic weight averaging in final 25% of
 SWA_LR = _cfg("swa_lr", 1e-5)     # SWA learning rate
 RESUME_FROM = _cfg("resume_from", "")  # path to checkpoint to resume training from
 USE_COMPILE = _cfg("use_compile", False)  # torch.compile() for faster training (PyTorch 2.0+, CUDA)
+GRAD_NOISE = _cfg("grad_noise", 0.0)     # Gaussian noise std added to gradients (0 = disabled)
+USE_WHOLE_WORD_MASK = _cfg("use_whole_word_mask", False)  # mask whole k-mers for kmer tokenizer
 
 # ---------------------------------------------------------------------------
 # Data augmentation utilities
@@ -273,6 +278,67 @@ def token_dropout_aug(tokens, mask, drop_rate, pad_id, num_special):
     out[drop_mask] = pad_id
     out_mask[drop_mask] = 0
     return out, out_mask
+
+
+def local_shuffle(tokens, mask, window_size, num_special):
+    """Shuffle tokens within local windows to preserve composition but disrupt order."""
+    out = tokens.clone()
+    B, L = tokens.shape
+    for i in range(B):
+        seq_len = int(mask[i].sum().item())
+        if seq_len < window_size:
+            continue
+        for start in range(0, seq_len - window_size + 1, window_size):
+            end = min(start + window_size, seq_len)
+            # Only shuffle non-special tokens within the window
+            window = out[i, start:end].clone()
+            valid = window >= num_special
+            if valid.sum() < 2:
+                continue
+            valid_idx = valid.nonzero(as_tuple=True)[0]
+            perm = valid_idx[torch.randperm(len(valid_idx))]
+            window[valid_idx] = window[perm]
+            out[i, start:end] = window
+    return out
+
+
+def whole_word_mask_tokens(tokens, mask, mask_ratio, mask_token_id, num_special, kmer_size=6):
+    """Mask whole k-mers instead of individual tokens for kmer tokenizer."""
+    input_ids = tokens.clone()
+    labels = tokens.clone()
+    B, L = tokens.shape
+
+    for i in range(B):
+        valid = (mask[i] == 1) & (tokens[i] >= num_special)
+        valid_positions = valid.nonzero(as_tuple=True)[0]
+        n_valid = len(valid_positions)
+        if n_valid == 0:
+            labels[i] = PAD_TOKEN_ID
+            continue
+
+        # Number of k-mer groups to mask
+        n_groups = max(1, n_valid // kmer_size)
+        n_to_mask = max(1, int(n_groups * mask_ratio))
+
+        # Pick random group starts (every kmer_size positions)
+        group_starts = list(range(0, n_valid, kmer_size))
+        if not group_starts:
+            labels[i] = PAD_TOKEN_ID
+            continue
+
+        chosen = torch.randperm(len(group_starts))[:n_to_mask]
+        masked = torch.zeros(L, dtype=torch.bool, device=tokens.device)
+
+        for g in chosen:
+            start = group_starts[g.item()]
+            for k in range(start, min(start + kmer_size, n_valid)):
+                pos = valid_positions[k].item()
+                masked[pos] = True
+
+        input_ids[i, masked] = mask_token_id
+        labels[i, ~masked] = PAD_TOKEN_ID
+
+    return input_ids, labels
 
 
 # ---------------------------------------------------------------------------
@@ -417,11 +483,13 @@ class DropPath(nn.Module):
 class GenomicTransformerLayer(nn.Module):
     """Custom Transformer layer supporting RoPE/ALiBi."""
 
-    def __init__(self, d_model, n_heads, d_ff, dropout, pos_type="sinusoidal", drop_path=0.0):
+    def __init__(self, d_model, n_heads, d_ff, dropout, pos_type="sinusoidal",
+                 drop_path=0.0, deepnorm_alpha=1.0):
         super().__init__()
         self.pos_type = pos_type
         self.n_heads = n_heads
         self.head_dim = d_model // n_heads
+        self.deepnorm_alpha = deepnorm_alpha  # DeepNorm residual scaling
 
         self.norm1 = nn.LayerNorm(d_model)
         self.norm2 = nn.LayerNorm(d_model)
@@ -493,10 +561,11 @@ class GenomicTransformerLayer(nn.Module):
 
         out = out.transpose(1, 2).reshape(B, L, D)
         out = self.out_proj(out)
-        x = x + self.drop_path(self.ff_dropout(out))
+        # DeepNorm: scale residual by alpha for stable deep training
+        x = x * self.deepnorm_alpha + self.drop_path(self.ff_dropout(out))
 
         # Feed-forward with pre-norm
-        x = x + self.drop_path(self.ff(self.norm2(x)))
+        x = x * self.deepnorm_alpha + self.drop_path(self.ff(self.norm2(x)))
         return x
 
 
@@ -505,11 +574,14 @@ class GenomicTransformer(nn.Module):
 
     def __init__(self, vocab_size, d_model, n_heads, d_ff, n_layers, max_len, dropout,
                  task_type, n_classes=None, pos_encoding="sinusoidal",
-                 stochastic_depth=0.0):
+                 stochastic_depth=0.0, use_deepnorm=False):
         super().__init__()
         self.task_type = task_type
         self.d_model = d_model
         self.pos_type = pos_encoding
+
+        # DeepNorm: α = (2N)^(1/4), β = (8N)^(-1/4) where N = n_layers
+        self._deepnorm_alpha = (2 * n_layers) ** 0.25 if use_deepnorm else 1.0
 
         self.embedding = nn.Embedding(vocab_size, d_model, padding_idx=PAD_TOKEN_ID)
 
@@ -538,7 +610,8 @@ class GenomicTransformer(nn.Module):
         if self.use_custom_layers:
             self.layers = nn.ModuleList([
                 GenomicTransformerLayer(d_model, n_heads, d_ff, dropout, pos_encoding,
-                                       drop_path=_dp_rates[i])
+                                       drop_path=_dp_rates[i],
+                                       deepnorm_alpha=self._deepnorm_alpha)
                 for i in range(n_layers)
             ])
         else:
@@ -896,6 +969,7 @@ def build_model(model_type, vocab_size, d_model, n_heads, d_ff, n_layers,
             n_layers=n_layers, max_len=max_len, dropout=dropout,
             task_type=task_type, n_classes=n_classes, pos_encoding=pe,
             stochastic_depth=STOCHASTIC_DEPTH,
+            use_deepnorm=USE_DEEPNORM,
         )
     elif model_type == "cnn":
         model = GenomicCNN(
@@ -1297,8 +1371,19 @@ if __name__ == "__main__":
                         tokens_batch, mask_batch = token_dropout_aug(
                             tokens_batch, mask_batch, TOKEN_DROPOUT, PAD_TOKEN_ID, NUM_SPECIAL)
 
+                    # Data augmentation: local shuffle
+                    if USE_LOCAL_SHUFFLE and SHUFFLE_WINDOW > 1:
+                        tokens_batch = local_shuffle(
+                            tokens_batch, mask_batch, SHUFFLE_WINDOW, NUM_SPECIAL)
+
                     if OBJECTIVE == "mlm":
-                        if USE_SPAN_MASKING:
+                        if USE_WHOLE_WORD_MASK:
+                            # Whole k-mer masking for kmer tokenizer
+                            input_ids, labels = whole_word_mask_tokens(
+                                tokens_batch, mask_batch, MASK_RATIO,
+                                MASK_TOKEN_ID, NUM_SPECIAL,
+                            )
+                        elif USE_SPAN_MASKING:
                             input_ids, labels = span_mask_tokens(
                                 tokens_batch, mask_batch, MASK_RATIO, SPAN_MEAN_LENGTH,
                                 MASK_TOKEN_ID, NUM_SPECIAL,
@@ -1359,6 +1444,13 @@ if __name__ == "__main__":
                             if p.grad is not None:
                                 _gnorms[name] = p.grad.data.norm(2).item()
                         history["grad_norms"].append({"step": step, "norms": _gnorms})
+
+                    # Gradient noise injection (decays over training)
+                    if GRAD_NOISE > 0 and elapsed_fraction < 0.5:
+                        _noise_std = GRAD_NOISE / (1 + step) ** 0.55
+                        for p in model.parameters():
+                            if p.grad is not None:
+                                p.grad.add_(torch.randn_like(p.grad) * _noise_std)
 
                     if scaler is not None:
                         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
