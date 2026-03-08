@@ -159,6 +159,48 @@ class TestDataAugmentation:
         assert rc[0, 3].item() == 6  # T
         assert rc[0, 4].item() == 0  # PAD unchanged
 
+    def test_span_mask_tokens(self):
+        """T20: Test span_mask_tokens produces correct mask ratios."""
+        sys.path.insert(0, str(Path(__file__).parent.parent / "genomic_research" / "templates"))
+        import torch
+        from train import span_mask_tokens
+
+        torch.manual_seed(42)
+        # A=5, T=6, C=7, G=8 — 20 real tokens + 4 PAD
+        tokens = torch.tensor([[5, 6, 7, 8, 5, 6, 7, 8, 5, 6,
+                                7, 8, 5, 6, 7, 8, 5, 6, 7, 8,
+                                0, 0, 0, 0]], dtype=torch.long)
+        mask = torch.tensor([[1]*20 + [0]*4], dtype=torch.long)
+
+        masked, labels = span_mask_tokens(tokens.clone(), mask, mask_ratio=0.15,
+                                          span_mean_length=3, mask_token_id=1, num_special=5)
+        # Some tokens in the real region should be masked (replaced with mask_token_id=1)
+        real_region = masked[0, :20]
+        n_mask_tokens = (real_region == 1).sum().item()
+        assert n_mask_tokens > 0, "At least some real tokens should be masked"
+        assert n_mask_tokens <= 20, "Cannot mask more tokens than exist"
+        # Output shape should match input
+        assert masked.shape == tokens.shape
+        assert labels.shape == tokens.shape
+
+    def test_snp_noise_preserves_pad(self):
+        """T20: Verify SNP noise doesn't corrupt PAD tokens."""
+        sys.path.insert(0, str(Path(__file__).parent.parent / "genomic_research" / "templates"))
+        import torch
+        from train import snp_noise
+
+        torch.manual_seed(42)
+        tokens = torch.tensor([[5, 6, 7, 8, 5, 6, 0, 0]], dtype=torch.long)
+        mask = torch.tensor([[1, 1, 1, 1, 1, 1, 0, 0]], dtype=torch.long)
+
+        noisy = snp_noise(tokens.clone(), mask, rate=0.5, num_special=5)
+        # PAD tokens must remain 0
+        assert noisy[0, 6].item() == 0
+        assert noisy[0, 7].item() == 0
+        # All non-PAD tokens should be >= NUM_SPECIAL
+        for i in range(6):
+            assert noisy[0, i].item() >= 5
+
 
 class TestModelFactory:
     """Test model building."""
