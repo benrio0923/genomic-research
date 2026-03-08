@@ -479,9 +479,18 @@ def cmd_predict(args):
     model.load_state_dict(ckpt["model_state_dict"])
     model.eval()
 
-    # Run predictions
+    # Run predictions (T148: sort by length for efficient batching)
     all_tokens = data.get("val_tokens", data.get("train_tokens"))
     all_masks = data.get("val_mask", data.get("train_mask"))
+
+    # Sort by sequence length to minimize padding waste
+    seq_lengths = all_masks.sum(dim=1)
+    sorted_indices = torch.argsort(seq_lengths, descending=True)
+    all_tokens = all_tokens[sorted_indices]
+    all_masks = all_masks[sorted_indices]
+    # Map back to original indices after processing
+    reverse_map = torch.zeros_like(sorted_indices)
+    reverse_map[sorted_indices] = torch.arange(len(sorted_indices))
 
     predictions = []
     batch_size = 32

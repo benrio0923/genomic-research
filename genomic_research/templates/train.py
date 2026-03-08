@@ -179,6 +179,12 @@ VARIANT_CONTEXT_WINDOW = _cfg("variant_context_window", 128)    # context bases 
 USE_PROMOTER_PRED = _cfg("use_promoter_pred", False)             # T129: per-position promoter/enhancer prediction
 DOWNSTREAM_TASK = _cfg("downstream_task", "")                     # T133-T135: amr, host_prediction, geographic_origin (sets up classify)
 
+# --- Experiment tracking ---
+USE_WANDB = _cfg("use_wandb", False)                              # T149: Weights & Biases logging
+WANDB_PROJECT = _cfg("wandb_project", "genomic-research")         # W&B project name
+USE_TENSORBOARD = _cfg("use_tensorboard", False)                  # T150: TensorBoard logging
+EXPERIMENT_TAG = _cfg("experiment_tag", "")                       # T156: descriptive experiment tag
+
 # ---------------------------------------------------------------------------
 # Data augmentation utilities
 # ---------------------------------------------------------------------------
@@ -2688,6 +2694,69 @@ if __name__ == "__main__":
 
 
     # ---------------------------------------------------------------------------
+    # T155: Config snapshot — save full hyperparams + git hash with each run
+    # ---------------------------------------------------------------------------
+    _run_config = {
+        "model_type": MODEL_TYPE, "d_model": D_MODEL, "n_layers": N_LAYERS,
+        "n_heads": N_HEADS, "d_ff": D_FF, "dropout": DROPOUT,
+        "lr": LEARNING_RATE, "weight_decay": WEIGHT_DECAY, "optimizer": OPTIMIZER,
+        "batch_size": actual_batch_size, "lr_schedule": LR_SCHEDULE,
+        "warmup_ratio": WARMUP_RATIO, "objective": OBJECTIVE,
+        "mask_ratio": MASK_RATIO, "seed": SEED, "task_type": task_type,
+        "vocab_size": vocab_size, "max_length": max_length,
+        "time_budget": TIME_BUDGET, "experiment_tag": EXPERIMENT_TAG,
+    }
+    # Capture git hash if available
+    try:
+        import subprocess as _sp
+        _git_hash = _sp.check_output(["git", "rev-parse", "--short", "HEAD"],
+                                     stderr=_sp.DEVNULL).decode().strip()
+        _run_config["git_hash"] = _git_hash
+    except Exception:
+        _run_config["git_hash"] = "unknown"
+
+    _run_config["timestamp"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    os.makedirs("checkpoints", exist_ok=True)
+    import json as _json
+    with open("checkpoints/run_config.json", "w") as _f:
+        _json.dump(_run_config, _f, indent=2)
+    print(f"Config snapshot saved to checkpoints/run_config.json")
+
+    # ---------------------------------------------------------------------------
+    # T149: Weights & Biases integration (optional)
+    # ---------------------------------------------------------------------------
+    _wandb_run = None
+    if USE_WANDB:
+        try:
+            import wandb
+            _wandb_run = wandb.init(
+                project=WANDB_PROJECT,
+                config=_run_config,
+                tags=[MODEL_TYPE, task_type, OBJECTIVE] + ([EXPERIMENT_TAG] if EXPERIMENT_TAG else []),
+                reinit=True,
+            )
+            print(f"W&B: logging to {WANDB_PROJECT}")
+        except ImportError:
+            print("W&B: wandb not installed (pip install wandb), skipping")
+        except Exception as e:
+            print(f"W&B: init failed ({e}), skipping")
+
+    # ---------------------------------------------------------------------------
+    # T150: TensorBoard logging (optional)
+    # ---------------------------------------------------------------------------
+    _tb_writer = None
+    if USE_TENSORBOARD:
+        try:
+            from torch.utils.tensorboard import SummaryWriter
+            _tb_writer = SummaryWriter(log_dir="runs")
+            _tb_writer.add_text("config", str(_run_config))
+            print("TensorBoard: logging to runs/")
+        except ImportError:
+            print("TensorBoard: tensorboard not installed, skipping")
+        except Exception as e:
+            print(f"TensorBoard: init failed ({e}), skipping")
+
+    # ---------------------------------------------------------------------------
     # Training loop
     # ---------------------------------------------------------------------------
 
@@ -3113,6 +3182,19 @@ if __name__ == "__main__":
                 _eta_m, _eta_s = divmod(int(remaining), 60)
                 print(f"\r{_bar} {pct_done:5.1f}% | step {step:05d} | loss {debiased_smooth_loss:.5f} | lr {lr:.1e} | ETA {_eta_m}m{_eta_s:02d}s    ", end="", flush=True)
 
+                # T149: W&B step logging
+                if _wandb_run is not None:
+                    try:
+                        import wandb
+                        wandb.log({"train/loss": debiased_smooth_loss, "train/lr": lr, "train/step": step}, step=step)
+                    except Exception:
+                        pass
+
+                # T150: TensorBoard step logging
+                if _tb_writer is not None:
+                    _tb_writer.add_scalar("train/loss", debiased_smooth_loss, step)
+                    _tb_writer.add_scalar("train/lr", lr, step)
+
             # Periodic evaluation
             if step > 5 and total_training_time - last_eval_time >= eval_interval_seconds:
                 model.eval()
@@ -3128,6 +3210,23 @@ if __name__ == "__main__":
                     history["eval_perplexities"].append(eval_results.get("val_perplexity", 0))
                     if "val_token_accuracy" in eval_results:
                         history["eval_token_accuracies"].append(eval_results["val_token_accuracy"])
+
+                # T149/T150: Log eval metrics
+                if _wandb_run is not None:
+                    try:
+                        import wandb
+                        _eval_log = {"eval/val_score": eval_results["val_score"]}
+                        for ek, ev in eval_results.items():
+                            if isinstance(ev, (int, float)):
+                                _eval_log[f"eval/{ek}"] = ev
+                        wandb.log(_eval_log, step=step)
+                    except Exception:
+                        pass
+                if _tb_writer is not None:
+                    _tb_writer.add_scalar("eval/val_score", eval_results["val_score"], step)
+                    for ek, ev in eval_results.items():
+                        if isinstance(ev, (int, float)) and ek != "val_score":
+                            _tb_writer.add_scalar(f"eval/{ek}", ev, step)
 
                 if best_val_score is None or eval_results["val_score"] > best_val_score:
                     best_val_score = eval_results["val_score"]
@@ -3524,6 +3623,19 @@ if __name__ == "__main__":
             writer.writerow(row)
 
     print(f"Results logged to {results_file}")
+
+    # T149/T150: Finalize experiment tracking
+    if _wandb_run is not None:
+        try:
+            import wandb
+            wandb.log({"final/val_score": results["val_score"]})
+            wandb.finish()
+            print("W&B: run finished")
+        except Exception:
+            pass
+    if _tb_writer is not None:
+        _tb_writer.close()
+        print("TensorBoard: writer closed")
 
     # ---------------------------------------------------------------------------
     # Optional: ONNX export
