@@ -132,6 +132,7 @@ SHUFFLE_WINDOW = _cfg("shuffle_window", 10)           # window size for local sh
 
 # --- Training infrastructure ---
 USE_AMP = True                 # automatic mixed precision (CUDA only)
+AMP_DTYPE = _cfg("amp_dtype", "float16")  # T173: "float16" or "bfloat16"
 GRAD_ACCUM_STEPS = 1           # gradient accumulation steps
 USE_GRAD_CHECKPOINT = False    # gradient checkpointing (saves memory)
 NUM_WORKERS = 0                # dataloader workers (0 = main process)
@@ -2445,12 +2446,27 @@ if __name__ == "__main__":
         print("Gradient checkpointing: enabled")
 
     # Mixed precision setup
-    amp_enabled = USE_AMP and device.type == "cuda"
-    amp_dtype = torch.float16 if amp_enabled else torch.float32
-    amp_device = device.type if amp_enabled else "cpu"  # avoid MPS autocast warnings
-    scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled) if amp_enabled else None
+    # T173: Support both float16 and bfloat16
+    amp_enabled = USE_AMP and device.type in ("cuda", "cpu")  # bfloat16 works on CPU too
+    if amp_enabled and device.type == "cuda":
+        if AMP_DTYPE == "bfloat16" and torch.cuda.is_bf16_supported():
+            amp_dtype = torch.bfloat16
+            # bfloat16 doesn't need GradScaler
+            scaler = None
+        else:
+            amp_dtype = torch.float16
+            scaler = torch.amp.GradScaler("cuda", enabled=True)
+    elif amp_enabled and device.type == "cpu" and AMP_DTYPE == "bfloat16":
+        amp_dtype = torch.bfloat16
+        scaler = None
+    else:
+        amp_enabled = amp_enabled and device.type == "cuda"
+        amp_dtype = torch.float16 if amp_enabled else torch.float32
+        scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled) if amp_enabled else None
+    amp_device = device.type if amp_enabled else "cpu"
     if amp_enabled:
-        print("Mixed precision: fp16 (CUDA AMP)")
+        dtype_name = "bf16" if amp_dtype == torch.bfloat16 else "fp16"
+        print(f"Mixed precision: {dtype_name} ({device.type} AMP)")
 
     # Model EMA
     ema = ModelEMA(model, decay=EMA_DECAY) if USE_EMA else None

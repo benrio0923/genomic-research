@@ -1428,6 +1428,168 @@ def cmd_compare(args):
         print(f"{key:<30} {v1:>12.4f} {v2:>12.4f} {sign}{delta:>11.4f} {sign}{pct:>6.1f}%")
 
 
+def cmd_hypersearch(args):
+    """Run hyperparameter search using Optuna (T152)."""
+    try:
+        import optuna
+    except ImportError:
+        print("Error: optuna not installed. Run: pip install optuna", file=sys.stderr)
+        sys.exit(1)
+
+    n_trials = args.trials
+    time_budget = args.time_budget
+
+    cwd = Path.cwd()
+    for f in ["prepare.py", "train.py"]:
+        if not (cwd / f).exists():
+            shutil.copy2(TEMPLATES_DIR / f, cwd / f)
+
+    def objective(trial):
+        # Define search space
+        cfg = {
+            "model_type": trial.suggest_categorical("model_type", ["transformer", "cnn", "lstm"]),
+            "d_model": trial.suggest_categorical("d_model", [64, 128, 256, 512]),
+            "n_layers": trial.suggest_int("n_layers", 2, 8),
+            "n_heads": trial.suggest_categorical("n_heads", [4, 8]),
+            "d_ff": trial.suggest_categorical("d_ff", [256, 512, 1024]),
+            "learning_rate": trial.suggest_float("lr", 1e-5, 1e-3, log=True),
+            "dropout": trial.suggest_float("dropout", 0.0, 0.3),
+            "batch_size": trial.suggest_categorical("batch_size", [16, 32, 64]),
+        }
+
+        # Write config overrides and run
+        env = os.environ.copy()
+        env["GENOMIC_TIME_BUDGET"] = str(time_budget)
+        for k, v in cfg.items():
+            env[f"GENOMIC_{k.upper()}"] = str(v)
+
+        result = subprocess.run(
+            [sys.executable, "train.py"],
+            cwd=str(cwd), env=env, capture_output=True, text=True,
+        )
+
+        # Parse val_score from output
+        for line in reversed(result.stdout.split("\n")):
+            if "val_score" in line:
+                try:
+                    val = float(line.split("val_score")[-1].strip().split()[0].strip(":="))
+                    return val
+                except (ValueError, IndexError):
+                    pass
+
+        # Fallback: check results.tsv last line
+        if os.path.exists("results.tsv"):
+            import csv
+            with open("results.tsv") as f:
+                reader = csv.DictReader(f, delimiter="\t")
+                rows = list(reader)
+                if rows:
+                    try:
+                        return float(rows[-1].get("val_score", 0))
+                    except ValueError:
+                        pass
+        return float("-inf")
+
+    study = optuna.create_study(direction="maximize", study_name="genomic-research")
+    study.optimize(objective, n_trials=n_trials, timeout=args.timeout)
+
+    print(f"\nBest trial: val_score = {study.best_value:.6f}")
+    print("Best hyperparameters:")
+    for k, v in study.best_params.items():
+        print(f"  {k}: {v}")
+
+    # Save best params
+    import json
+    with open("best_hyperparams.json", "w") as f:
+        json.dump({"best_value": study.best_value, "best_params": study.best_params}, f, indent=2)
+    print("\nSaved to best_hyperparams.json")
+
+
+def cmd_best_model(args):
+    """Find the best model across all experiments (T157)."""
+    import csv
+
+    results_file = args.file or "results.tsv"
+    if not os.path.exists(results_file):
+        print(f"Error: {results_file} not found.", file=sys.stderr)
+        sys.exit(1)
+
+    with open(results_file, newline="") as f:
+        reader = csv.DictReader(f, delimiter="\t")
+        rows = list(reader)
+
+    if not rows:
+        print("No experiments found.")
+        return
+
+    # Find best by val_score
+    best = max(rows, key=lambda r: float(r.get("val_score", "-inf")))
+    print(f"Best experiment:")
+    for k, v in best.items():
+        print(f"  {k}: {v}")
+
+    # Copy best checkpoint to best_overall/
+    ckpt_path = "checkpoints/best_model.pt"
+    if os.path.exists(ckpt_path):
+        os.makedirs("best_overall", exist_ok=True)
+        dest = "best_overall/best_model.pt"
+        shutil.copy2(ckpt_path, dest)
+        print(f"\nBest checkpoint copied to {dest}")
+    else:
+        print(f"\nNote: {ckpt_path} not found — run the best config again to get the checkpoint")
+
+
+def cmd_experiment_diff(args):
+    """Compare hyperparameters between two experiment runs (T158)."""
+    import json
+
+    path1 = args.config1
+    path2 = args.config2
+
+    if not os.path.exists(path1):
+        print(f"Error: {path1} not found", file=sys.stderr)
+        sys.exit(1)
+    if not os.path.exists(path2):
+        print(f"Error: {path2} not found", file=sys.stderr)
+        sys.exit(1)
+
+    with open(path1) as f:
+        c1 = json.load(f)
+    with open(path2) as f:
+        c2 = json.load(f)
+
+    # Flatten nested dicts
+    def _flatten(d, prefix=""):
+        items = {}
+        for k, v in d.items():
+            key = f"{prefix}{k}" if not prefix else f"{prefix}.{k}"
+            if isinstance(v, dict):
+                items.update(_flatten(v, key))
+            else:
+                items[key] = v
+        return items
+
+    f1 = _flatten(c1)
+    f2 = _flatten(c2)
+    all_keys = sorted(set(list(f1.keys()) + list(f2.keys())))
+
+    print(f"{'Parameter':<35} {'Config 1':>20} {'Config 2':>20} {'Changed':>8}")
+    print("-" * 85)
+    changed_count = 0
+    for k in all_keys:
+        v1 = f1.get(k, "—")
+        v2 = f2.get(k, "—")
+        is_changed = str(v1) != str(v2)
+        marker = "  <<<" if is_changed else ""
+        if is_changed:
+            changed_count += 1
+        if args.diff_only and not is_changed:
+            continue
+        print(f"{k:<35} {str(v1):>20} {str(v2):>20}{marker}")
+
+    print(f"\n{changed_count} parameter(s) differ")
+
+
 def cmd_leaderboard(args):
     """Show experiment leaderboard from results.tsv, ranked by val_score (T153)."""
     import csv
@@ -1658,6 +1820,22 @@ def main():
     p_card.add_argument("--checkpoint", type=str, default="checkpoints/best_model.pt")
     p_card.add_argument("--output", type=str, default=None, help="Output path (default: MODEL_CARD.md)")
 
+    # hypersearch
+    p_hs = subparsers.add_parser("hypersearch", help="Run hyperparameter search with Optuna")
+    p_hs.add_argument("--trials", type=int, default=10, help="Number of Optuna trials")
+    p_hs.add_argument("--time-budget", type=int, default=60, help="Time budget per trial (seconds)")
+    p_hs.add_argument("--timeout", type=int, default=None, help="Total timeout for search (seconds)")
+
+    # best-model
+    p_bm = subparsers.add_parser("best-model", help="Find and copy the best model across experiments")
+    p_bm.add_argument("--file", type=str, default=None, help="Path to results.tsv")
+
+    # experiment-diff
+    p_diff = subparsers.add_parser("experiment-diff", help="Compare configs between two runs")
+    p_diff.add_argument("config1", help="Path to first run_config.json")
+    p_diff.add_argument("config2", help="Path to second run_config.json")
+    p_diff.add_argument("--diff-only", action="store_true", help="Show only changed parameters")
+
     # leaderboard
     p_lb = subparsers.add_parser("leaderboard", help="Show experiment leaderboard ranked by val_score")
     p_lb.add_argument("--file", type=str, default=None, help="Path to results.tsv")
@@ -1711,6 +1889,12 @@ def main():
         cmd_leaderboard(args)
     elif args.command == "archive":
         cmd_archive(args)
+    elif args.command == "hypersearch":
+        cmd_hypersearch(args)
+    elif args.command == "best-model":
+        cmd_best_model(args)
+    elif args.command == "experiment-diff":
+        cmd_experiment_diff(args)
     else:
         parser.print_help()
 
