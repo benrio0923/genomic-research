@@ -140,6 +140,12 @@ def _load_csv_sequences(path, seq_col=None, id_col=None):
     with open(path, newline="") as f:
         reader = csv.DictReader(f)
         fields = reader.fieldnames
+        if not fields:
+            raise ValueError(f"CSV file has no header row: {path}")
+        if seq_col and seq_col not in fields:
+            raise ValueError(f"Column '{seq_col}' not found in CSV. Available: {fields}")
+        if id_col and id_col not in fields:
+            raise ValueError(f"ID column '{id_col}' not found in CSV. Available: {fields}")
         if seq_col is None:
             # Auto-detect: look for common names
             for candidate in ["sequence", "seq", "dna", "nucleotide", "Sequence"]:
@@ -372,6 +378,19 @@ def prepare_data(
     """
     os.makedirs(CACHE_DIR, exist_ok=True)
 
+    # Input validation
+    if not os.path.exists(seq_path):
+        raise FileNotFoundError(f"Input file not found: {seq_path}")
+    if labels_path and not os.path.exists(labels_path):
+        raise FileNotFoundError(f"Labels file not found: {labels_path}")
+    if task_type not in ("pretrain", "classify", "regress"):
+        raise ValueError(f"Unknown task type: {task_type}. Must be 'pretrain', 'classify', or 'regress'.")
+    if seq_col and not seq_path.lower().endswith(".csv"):
+        print("Warning: --seq-col specified but file does not end with .csv")
+    if task_type in ("classify", "regress") and not labels_path and not seq_col:
+        print("Warning: classify/regress task but no labels source specified. "
+              "Use --labels <file> or --seq-col + --label-col for CSV input.")
+
     # Load sequences
     print(f"Loading sequences from {seq_path}...")
     sequences = load_sequences(seq_path, seq_col=seq_col, id_col=id_col)
@@ -443,6 +462,14 @@ def prepare_data(
         labels_map = {k: label_to_id[v] for k, v in labels_map.items()}
         target_names = unique_labels
         n_classes = len(unique_labels)
+        # Warn about small classes
+        from collections import Counter
+        label_counts = Counter(labels_map.values())
+        small_classes = [target_names[lid] for lid, cnt in label_counts.items() if cnt < 3]
+        if small_classes:
+            print(f"  Warning: {len(small_classes)} class(es) have < 3 samples: {small_classes[:5]}")
+        if n_classes < 2:
+            raise ValueError("Classification requires at least 2 classes.")
     elif task_type == "regress" and labels_map:
         labels_map = {k: float(v) for k, v in labels_map.items()}
         n_classes = 1
@@ -458,16 +485,26 @@ def prepare_data(
                 all_token_ids.append(chunk)
         print(f"  Created {len(all_token_ids)} chunks from {len(tokenized)} sequences")
     else:
+        # For classify/regress: chunk long sequences, each chunk inherits the label.
+        # This allows the model to see patterns across the full genome.
+        n_chunked = 0
         for sid, tokens in tokenized:
-            # Truncate to max_length for classification/regression
-            tokens = tokens[:max_length]
-            all_token_ids.append(tokens)
+            label = None
             if labels_map:
-                label = labels_map.get(sid)
+                label = labels_map.get(sid, 0 if task_type == "classify" else 0.0)
+
+            if len(tokens) > max_length:
+                chunks = _chunk_tokens(tokens, max_length)
+                n_chunked += 1
+            else:
+                chunks = [tokens]
+
+            for chunk in chunks:
+                all_token_ids.append(chunk)
                 if label is not None:
                     all_labels.append(label)
-                else:
-                    all_labels.append(0 if task_type == "classify" else 0.0)
+        if n_chunked > 0:
+            print(f"  Chunked {n_chunked}/{len(tokenized)} long sequences → {len(all_token_ids)} samples")
 
     # Pad sequences to uniform length
     actual_max_len = min(max_length, max(len(t) for t in all_token_ids))
@@ -570,11 +607,19 @@ def prepare_data(
 
 def load_config():
     """Load task config from cache."""
-    assert os.path.exists(CONFIG_PATH), (
-        f"No task config found at {CONFIG_PATH}. Run prepare.py first."
-    )
+    if not os.path.exists(CONFIG_PATH):
+        raise FileNotFoundError(
+            f"No task config found at {CONFIG_PATH}.\n"
+            f"Run prepare.py first:\n"
+            f"  python prepare.py --fasta <file> --task pretrain"
+        )
     with open(CONFIG_PATH) as f:
-        return json.load(f)
+        config = json.load(f)
+    required = ["task_type", "vocab_size", "max_length", "n_train", "n_val"]
+    missing = [k for k in required if k not in config]
+    if missing:
+        raise ValueError(f"Invalid task config: missing keys {missing}. Re-run prepare.py.")
+    return config
 
 
 def load_data(device="cpu"):

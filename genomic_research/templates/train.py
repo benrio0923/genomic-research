@@ -10,10 +10,20 @@ Usage: python train.py
 
 import math
 import os
+import signal
 import time
 
 import torch
 import torch.nn as nn
+
+# Graceful shutdown on SIGINT/SIGTERM
+_interrupted = False
+def _signal_handler(signum, frame):
+    global _interrupted
+    _interrupted = True
+    print("\nInterrupt received — finishing current step and saving...")
+signal.signal(signal.SIGINT, _signal_handler)
+signal.signal(signal.SIGTERM, _signal_handler)
 
 from prepare import (
     TIME_BUDGET, MASK_TOKEN_ID, PAD_TOKEN_ID, NUM_SPECIAL,
@@ -86,6 +96,7 @@ USE_GRAD_CHECKPOINT = False    # gradient checkpointing (saves memory)
 NUM_WORKERS = 0                # dataloader workers (0 = main process)
 PIN_MEMORY = False             # pin memory for faster CUDA transfer
 USE_DDP = False                # distributed data parallel (multi-GPU)
+SEED = _cfg("seed", 42)       # random seed for reproducibility
 
 # ---------------------------------------------------------------------------
 # Data augmentation utilities
@@ -381,8 +392,14 @@ class GenomicTransformer(nn.Module):
 
             if self.task_type == "pretrain" and hasattr(self, '_use_causal') and self._use_causal:
                 sz = input_ids.size(1)
-                causal_mask = nn.Transformer.generate_square_subsequent_mask(sz, device=input_ids.device)
-                x = self.encoder(x, mask=causal_mask, src_key_padding_mask=src_key_padding_mask)
+                causal_mask = torch.triu(
+                    torch.full((sz, sz), float("-inf"), device=input_ids.device), diagonal=1
+                )
+                # Convert padding mask to float to match causal mask type
+                pad_mask = src_key_padding_mask
+                if pad_mask is not None and pad_mask.dtype == torch.bool:
+                    pad_mask = torch.zeros_like(pad_mask, dtype=torch.float).masked_fill_(pad_mask, float("-inf"))
+                x = self.encoder(x, mask=causal_mask, src_key_padding_mask=pad_mask)
             else:
                 x = self.encoder(x, src_key_padding_mask=src_key_padding_mask)
 
@@ -645,7 +662,15 @@ def build_model(model_type, vocab_size, d_model, n_heads, d_ff, n_layers,
 # ---------------------------------------------------------------------------
 
 t_start = time.time()
-torch.manual_seed(42)
+
+# Seed everything for reproducibility
+import random
+import numpy as np
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(SEED)
 
 # DDP setup
 _ddp_rank = 0
@@ -664,12 +689,10 @@ if USE_DDP and torch.cuda.is_available() and torch.cuda.device_count() > 1:
     _is_main_process = _ddp_rank == 0
     device = torch.device(f"cuda:{_ddp_rank}")
     torch.cuda.set_device(device)
-    torch.cuda.manual_seed(42)
     if _is_main_process:
         print(f"DDP: {_ddp_world_size} GPUs")
 elif torch.cuda.is_available():
     device = torch.device("cuda")
-    torch.cuda.manual_seed(42)
 elif torch.backends.mps.is_available():
     device = torch.device("mps")
 else:
@@ -726,6 +749,7 @@ if USE_GRAD_CHECKPOINT and hasattr(model, 'encoder'):
 # Mixed precision setup
 amp_enabled = USE_AMP and device.type == "cuda"
 amp_dtype = torch.float16 if amp_enabled else torch.float32
+amp_device = device.type if amp_enabled else "cpu"  # avoid MPS autocast warnings
 scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled) if amp_enabled else None
 if amp_enabled:
     print("Mixed precision: fp16 (CUDA AMP)")
@@ -839,7 +863,7 @@ while True:
                 mask_batch = mask_batch.to(device)
                 labels_batch = labels_batch.to(device)
 
-                with torch.amp.autocast(device.type, enabled=amp_enabled, dtype=amp_dtype):
+                with torch.amp.autocast(amp_device, enabled=amp_enabled, dtype=amp_dtype):
                     output = model(tokens_batch, attention_mask=mask_batch)
                     if task_type == "regress":
                         output = output.squeeze(-1)
@@ -869,7 +893,7 @@ while True:
                         input_ids[mask_positions] = MASK_TOKEN_ID
                         labels[~mask_positions] = PAD_TOKEN_ID
 
-                    with torch.amp.autocast(device.type, enabled=amp_enabled, dtype=amp_dtype):
+                    with torch.amp.autocast(amp_device, enabled=amp_enabled, dtype=amp_dtype):
                         logits = model(input_ids, attention_mask=mask_batch)
                         loss = criterion(logits.reshape(-1, vocab_size), labels.reshape(-1))
 
@@ -878,7 +902,7 @@ while True:
                     target_ids = tokens_batch[:, 1:]
                     input_mask = mask_batch[:, :-1]
 
-                    with torch.amp.autocast(device.type, enabled=amp_enabled, dtype=amp_dtype):
+                    with torch.amp.autocast(amp_device, enabled=amp_enabled, dtype=amp_dtype):
                         logits = model(input_ids, attention_mask=input_mask)
                         loss = criterion(logits.reshape(-1, vocab_size), target_ids.reshape(-1))
 
@@ -962,10 +986,10 @@ while True:
 
         step += 1
 
-        if step > 5 and total_training_time >= TIME_BUDGET:
+        if (step > 5 and total_training_time >= TIME_BUDGET) or _interrupted:
             break
 
-    if step > 5 and total_training_time >= TIME_BUDGET:
+    if (step > 5 and total_training_time >= TIME_BUDGET) or _interrupted:
         break
 
 print()
