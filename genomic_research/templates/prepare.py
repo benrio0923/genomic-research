@@ -799,6 +799,83 @@ def compute_gc_content_features(sequence, window_size=50, stride=10):
     return np.array(gc_features, dtype=np.float32)
 
 
+def phylogenetic_split(sequences, val_ratio=0.2, kmer_k=4, seed=42):
+    """Split sequences into train/val based on k-mer distance to reduce data leakage.
+
+    Groups similar sequences by k-mer profile clustering, then assigns
+    entire clusters to train or val to ensure phylogenetically distant splits.
+
+    Args:
+        sequences: list of (id, sequence) tuples.
+        val_ratio: fraction for validation set.
+        kmer_k: k-mer size for distance computation.
+        seed: random seed.
+
+    Returns: (train_indices, val_indices) as numpy arrays.
+    """
+    rng = np.random.RandomState(seed)
+    n = len(sequences)
+    if n < 4:
+        # Too few sequences for clustering, fall back to random
+        idx = np.arange(n)
+        rng.shuffle(idx)
+        split = max(1, int(n * val_ratio))
+        return idx[split:], idx[:split]
+
+    # Build k-mer frequency vectors
+    bases = "ATCG"
+    all_kmers = []
+    def _gen(prefix, depth):
+        if depth == 0:
+            all_kmers.append(prefix)
+            return
+        for b in bases:
+            _gen(prefix + b, depth - 1)
+    _gen("", kmer_k)
+    kmer_to_idx = {km: i for i, km in enumerate(all_kmers)}
+    dim = len(all_kmers)
+
+    profiles = np.zeros((n, dim), dtype=np.float32)
+    for si, (_, seq) in enumerate(sequences):
+        for i in range(len(seq) - kmer_k + 1):
+            kmer = seq[i:i+kmer_k]
+            ki = kmer_to_idx.get(kmer)
+            if ki is not None:
+                profiles[si, ki] += 1
+        total = profiles[si].sum()
+        if total > 0:
+            profiles[si] /= total
+
+    # Simple greedy clustering by cosine distance
+    from sklearn.cluster import KMeans
+    n_clusters = max(5, n // 10)
+    n_clusters = min(n_clusters, n)
+    km = KMeans(n_clusters=n_clusters, random_state=seed, n_init=3, max_iter=100)
+    labels = km.fit_predict(profiles)
+
+    # Assign entire clusters to val until we reach val_ratio
+    cluster_ids = np.unique(labels)
+    rng.shuffle(cluster_ids)
+    val_count = 0
+    target_val = int(n * val_ratio)
+    val_mask = np.zeros(n, dtype=bool)
+    for c in cluster_ids:
+        members = np.where(labels == c)[0]
+        if val_count + len(members) <= target_val + len(members) // 2:
+            val_mask[members] = True
+            val_count += len(members)
+            if val_count >= target_val:
+                break
+
+    if val_count == 0:
+        # Fallback: assign smallest cluster to val
+        sizes = [(labels == c).sum() for c in cluster_ids]
+        smallest = cluster_ids[np.argmin(sizes)]
+        val_mask[labels == smallest] = True
+
+    return np.where(~val_mask)[0], np.where(val_mask)[0]
+
+
 def create_tokenizer(tokenizer_type="char", kmer_size=6, bpe_vocab_size=4096):
     """Factory function to create a tokenizer."""
     if tokenizer_type == "char":

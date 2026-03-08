@@ -171,6 +171,13 @@ DISTILL_TEMP = _cfg("distill_temp", 2.0)                        # temperature fo
 AUX_LOSSES = _cfg("aux_losses", [])                             # auxiliary losses: ["contrastive", "denoise", "clm"]
 AUX_LOSS_WEIGHT = _cfg("aux_loss_weight", 0.1)                  # weight for each auxiliary loss
 
+# --- Downstream task extensions ---
+HIERARCHICAL_LEVELS = _cfg("hierarchical_levels", [])            # e.g. ["family", "genus", "species"] for T126
+HIERARCHICAL_N_CLASSES = _cfg("hierarchical_n_classes", [])      # n_classes per level, e.g. [10, 50, 200]
+USE_VARIANT_EFFECT = _cfg("use_variant_effect", False)           # T128: variant effect prediction mode
+VARIANT_CONTEXT_WINDOW = _cfg("variant_context_window", 128)    # context bases around variant position
+USE_PROMOTER_PRED = _cfg("use_promoter_pred", False)             # T129: per-position promoter/enhancer prediction
+
 # ---------------------------------------------------------------------------
 # Data augmentation utilities
 # ---------------------------------------------------------------------------
@@ -2152,6 +2159,78 @@ def _init_weights(module, d_model):
                 nn.init.zeros_(param)
 
 
+# ---------------------------------------------------------------------------
+# T126: Hierarchical taxonomy classification head
+# ---------------------------------------------------------------------------
+
+class HierarchicalClassifier(nn.Module):
+    """Multi-level classification head for taxonomic hierarchy (Family → Genus → Species).
+
+    Adds separate classification heads for each taxonomic level.
+    The [CLS] embedding is shared, but each level has its own linear head.
+    """
+
+    def __init__(self, d_model, level_n_classes):
+        super().__init__()
+        self.heads = nn.ModuleList([
+            nn.Linear(d_model, nc) for nc in level_n_classes
+        ])
+
+    def forward(self, cls_embedding):
+        """Returns list of logits, one per hierarchy level."""
+        return [head(cls_embedding) for head in self.heads]
+
+
+# ---------------------------------------------------------------------------
+# T128: Variant effect prediction head
+# ---------------------------------------------------------------------------
+
+class VariantEffectHead(nn.Module):
+    """Predict variant effects from contextual embeddings at mutation position.
+
+    Takes the hidden state at the variant position + ref/alt token embeddings,
+    and predicts pathogenic vs benign (binary classification).
+    """
+
+    def __init__(self, d_model, n_classes=2):
+        super().__init__()
+        # Concat: position embedding + ref embedding + alt embedding
+        self.classifier = nn.Sequential(
+            nn.Linear(d_model * 3, d_model),
+            nn.GELU(),
+            nn.Dropout(0.1),
+            nn.Linear(d_model, n_classes),
+        )
+
+    def forward(self, position_embedding, ref_embedding, alt_embedding):
+        combined = torch.cat([position_embedding, ref_embedding, alt_embedding], dim=-1)
+        return self.classifier(combined)
+
+
+# ---------------------------------------------------------------------------
+# T129: Per-position promoter/enhancer prediction head
+# ---------------------------------------------------------------------------
+
+class PromoterPredictionHead(nn.Module):
+    """Per-position binary classification: regulatory (promoter/enhancer) vs non-regulatory.
+
+    Takes full sequence hidden states and predicts a label per position.
+    """
+
+    def __init__(self, d_model, n_classes=2):
+        super().__init__()
+        self.classifier = nn.Sequential(
+            nn.Linear(d_model, d_model // 2),
+            nn.GELU(),
+            nn.Dropout(0.1),
+            nn.Linear(d_model // 2, n_classes),
+        )
+
+    def forward(self, hidden_states):
+        """hidden_states: (B, L, d_model) → (B, L, n_classes)"""
+        return self.classifier(hidden_states)
+
+
 def build_model(model_type, vocab_size, d_model, n_heads, d_ff, n_layers,
                 max_len, dropout, task_type, n_classes=None,
                 pos_encoding=None, **kwargs):
@@ -2312,6 +2391,24 @@ if __name__ == "__main__":
 
     if OBJECTIVE == "clm":
         model._use_causal = True
+
+    # T126: Hierarchical taxonomy classification heads
+    _hierarchical_head = None
+    if HIERARCHICAL_LEVELS and HIERARCHICAL_N_CLASSES and task_type == "classify":
+        _hierarchical_head = HierarchicalClassifier(D_MODEL, HIERARCHICAL_N_CLASSES).to(device)
+        print(f"Hierarchical classification: {list(zip(HIERARCHICAL_LEVELS, HIERARCHICAL_N_CLASSES))}")
+
+    # T128: Variant effect prediction head
+    _variant_head = None
+    if USE_VARIANT_EFFECT:
+        _variant_head = VariantEffectHead(D_MODEL).to(device)
+        print("Variant effect prediction: enabled")
+
+    # T129: Promoter/enhancer per-position prediction head
+    _promoter_head = None
+    if USE_PROMOTER_PRED:
+        _promoter_head = PromoterPredictionHead(D_MODEL).to(device)
+        print("Promoter prediction: enabled (per-position binary)")
 
     # torch.compile() for faster training (PyTorch 2.0+)
     if USE_COMPILE and hasattr(torch, "compile"):
@@ -2474,6 +2571,11 @@ if __name__ == "__main__":
         return param_groups
 
     _param_groups = _get_param_groups(model, LEARNING_RATE, WEIGHT_DECAY, LR_LAYER_DECAY)
+
+    # Add extension head parameters to optimizer
+    for _ext_head in [_hierarchical_head, _variant_head, _promoter_head]:
+        if _ext_head is not None:
+            _param_groups.append({"params": _ext_head.parameters(), "lr": LEARNING_RATE, "weight_decay": WEIGHT_DECAY})
 
     # Optimizer
     if USE_SAM:
