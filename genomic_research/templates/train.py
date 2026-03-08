@@ -1851,9 +1851,46 @@ if __name__ == "__main__":
     except Exception:
         pass
 
+    # Extract attention weights for visualization (Transformer only)
+    attention_weights = None
+    if MODEL_TYPE == "transformer" and hasattr(model, 'layers'):
+        try:
+            with torch.no_grad():
+                sample_tokens = data["val_tokens"][:1].to(device)
+                sample_mask = data["val_mask"][:1].to(device)
+                x = model.embedding(sample_tokens)
+                x = model.emb_dropout(x) if hasattr(model, 'emb_dropout') else x
+                L = sample_tokens.size(1)
+                rotary_freqs = model.rotary(L, device) if hasattr(model, 'rotary') else None
+                attn_bias = model.alibi(L, device) if hasattr(model, 'alibi') else None
+                key_pad = (sample_mask == 0)
+
+                # Get attention from first layer
+                layer = model.layers[0]
+                h = layer.norm1(x) if layer.norm_position == "pre" else x
+                B = 1
+                q = layer.q_proj(h).view(B, L, layer.n_heads, layer.head_dim).transpose(1, 2)
+                k = layer.k_proj(h).view(B, L, layer.n_heads, layer.head_dim).transpose(1, 2)
+                if rotary_freqs is not None:
+                    q, k = apply_rotary_emb(q, k, rotary_freqs)
+                scale = layer.head_dim ** -0.5
+                attn = torch.matmul(q, k.transpose(-2, -1)) * scale
+                if attn_bias is not None:
+                    attn = attn + attn_bias
+                attn = attn.masked_fill(key_pad.unsqueeze(1).unsqueeze(2), float("-inf"))
+                attn = torch.softmax(attn, dim=-1)
+                # Average over heads, take first sample → (L, L)
+                attention_weights = attn[0].mean(dim=0).cpu().numpy()
+                # Crop to actual sequence length
+                seq_len = int(sample_mask[0].sum().item())
+                attention_weights = attention_weights[:seq_len, :seq_len]
+        except Exception:
+            pass
+
     generate_report(results, task_type, config, training_history=history,
                     report_dir="reports", run_info=run_info,
-                    embeddings=embeddings, embed_labels=embed_labels)
+                    embeddings=embeddings, embed_labels=embed_labels,
+                    attention_weights=attention_weights)
 
     # ---------------------------------------------------------------------------
     # Save model checkpoint

@@ -652,6 +652,31 @@ def prepare_data(
         padded[i, :length] = tokens[:length]
         attention_mask[i, :length] = 1
 
+    # Per-sample metadata for bias analysis (T100, T101)
+    sample_lengths = np.array([min(len(t), actual_max_len) for t in all_token_ids], dtype=np.int32)
+    # Compute per-sample GC content from token IDs (for char tokenizer: G=7+5=12..depends on token mapping)
+    # Simpler: compute from padded tokens using the tokenizer's decode
+    sample_gc = np.zeros(len(all_token_ids), dtype=np.float32)
+    if tokenizer_type == "char":
+        # CharTokenizer: C=7, G=8
+        gc_ids = np.array([7, 8])
+        for i in range(len(all_token_ids)):
+            toks = padded[i, :sample_lengths[i]]
+            gc_count = np.isin(toks, gc_ids).sum()
+            sample_gc[i] = gc_count / max(sample_lengths[i], 1)
+    else:
+        # For kmer/bpe: decode tokens then count GC
+        for i in range(len(all_token_ids)):
+            try:
+                decoded = tokenizer.decode(padded[i, :sample_lengths[i]].tolist())
+                gc_count = decoded.count("G") + decoded.count("C")
+                sample_gc[i] = gc_count / max(len(decoded), 1)
+            except Exception:
+                pass
+
+    torch.save(torch.from_numpy(sample_lengths), os.path.join(CACHE_DIR, "sample_lengths.pt"))
+    torch.save(torch.from_numpy(sample_gc), os.path.join(CACHE_DIR, "sample_gc.pt"))
+
     # Train/val split
     from sklearn.model_selection import train_test_split
 
@@ -1144,12 +1169,14 @@ def _evaluate_regress(model, val_tokens, val_mask, val_labels, batch_size, devic
 # ---------------------------------------------------------------------------
 
 def generate_report(results, task_type, config, training_history=None,
-                    report_dir="reports", run_info=None, embeddings=None, embed_labels=None):
+                    report_dir="reports", run_info=None, embeddings=None, embed_labels=None,
+                    attention_weights=None):
     """Generate experiment report with plots and metrics.
 
     Args:
         embeddings: Optional (N, D) numpy array of sequence embeddings for t-SNE.
         embed_labels: Optional (N,) labels for coloring t-SNE points.
+        attention_weights: Optional (L, L) attention weight matrix for heatmap.
     """
     import matplotlib
     matplotlib.use("Agg")
@@ -1206,6 +1233,23 @@ def generate_report(results, task_type, config, training_history=None,
         _generate_classification_report(results, config, target_names, preds, targets, report_dir, probs)
     elif task_type == "regress":
         _generate_regression_report(results, config, preds, targets, report_dir)
+
+    # --- Attention weight heatmap (T93) ---
+    if attention_weights is not None:
+        try:
+            L = min(attention_weights.shape[0], 128)  # Cap at 128 for readability
+            attn_crop = attention_weights[:L, :L]
+            fig, ax = plt.subplots(figsize=(10, 8))
+            im = ax.imshow(attn_crop, cmap="viridis", aspect="auto")
+            ax.set_title("Attention Weights (Layer 0, Head Average)")
+            ax.set_xlabel("Key Position")
+            ax.set_ylabel("Query Position")
+            fig.colorbar(im, ax=ax, shrink=0.8)
+            fig.tight_layout()
+            fig.savefig(os.path.join(report_dir, "attention_map.png"), dpi=150)
+            plt.close(fig)
+        except Exception:
+            pass
 
     # --- Embedding t-SNE visualization ---
     if embeddings is not None and len(embeddings) > 10:
@@ -1269,6 +1313,38 @@ def generate_report(results, task_type, config, training_history=None,
         except (ImportError, Exception):
             pass
 
+    # --- Embedding UMAP visualization (T95, optional) ---
+    if embeddings is not None and len(embeddings) > 10:
+        try:
+            import umap
+            reducer = umap.UMAP(n_components=2, random_state=42, n_neighbors=min(15, len(embeddings) - 1))
+            coords = reducer.fit_transform(embeddings)
+
+            fig, ax = plt.subplots(figsize=(8, 8))
+            if embed_labels is not None:
+                unique_labels = np.unique(embed_labels)
+                colors = plt.cm.tab10(np.linspace(0, 1, min(len(unique_labels), 10)))
+                for i, label in enumerate(unique_labels[:10]):
+                    lmask = embed_labels == label
+                    lbl = target_names[int(label)] if int(label) < len(target_names) else str(label)
+                    ax.scatter(coords[lmask, 0], coords[lmask, 1], c=[colors[i % 10]],
+                              label=lbl, alpha=0.6, s=15, edgecolors="none")
+                ax.legend(fontsize=8, markerscale=2)
+            else:
+                ax.scatter(coords[:, 0], coords[:, 1], alpha=0.5, s=15,
+                          color="#2196F3", edgecolors="none")
+            ax.set_title("Embedding UMAP")
+            ax.set_xlabel("UMAP 1")
+            ax.set_ylabel("UMAP 2")
+            ax.grid(True, alpha=0.3)
+            fig.tight_layout()
+            fig.savefig(os.path.join(report_dir, "embedding_umap.png"), dpi=150)
+            plt.close(fig)
+        except ImportError:
+            pass  # umap-learn not installed, skip silently
+        except Exception:
+            pass
+
     # --- Gradient norm plot ---
     if training_history and "grad_norms" in training_history and training_history["grad_norms"]:
         try:
@@ -1302,6 +1378,87 @@ def generate_report(results, task_type, config, training_history=None,
                 fig.tight_layout()
                 fig.savefig(os.path.join(report_dir, "gradient_norms.png"), dpi=150)
                 plt.close(fig)
+        except Exception:
+            pass
+
+    # --- GC content bias analysis (T100) ---
+    gc_path = os.path.join(CACHE_DIR, "sample_gc.pt")
+    if os.path.exists(gc_path) and results.get("predictions") is not None and results.get("targets") is not None:
+        try:
+            all_gc = torch.load(gc_path, map_location="cpu", weights_only=True).numpy()
+            val_n = config.get("n_val", 0)
+            # val samples are the last n_val in the original data
+            if len(all_gc) >= val_n and val_n > 0:
+                val_gc = all_gc[-val_n:]
+                preds_arr = np.array(results["predictions"])
+                targets_arr = np.array(results["targets"])
+                n_bins = min(5, len(val_gc) // 5)
+                if n_bins >= 2:
+                    bins = np.quantile(val_gc, np.linspace(0, 1, n_bins + 1))
+                    bins[-1] += 0.001
+                    bin_labels = [f"{bins[i]:.2f}-{bins[i+1]:.2f}" for i in range(n_bins)]
+                    bin_accs = []
+                    for i in range(n_bins):
+                        mask = (val_gc >= bins[i]) & (val_gc < bins[i + 1])
+                        if mask.sum() > 0:
+                            if task_type == "classify":
+                                bin_accs.append(float((preds_arr[mask] == targets_arr[mask]).mean()))
+                            else:
+                                bin_accs.append(float(-np.mean((preds_arr[mask] - targets_arr[mask]) ** 2)))
+                        else:
+                            bin_accs.append(0)
+
+                    fig, ax = plt.subplots(figsize=(8, 5))
+                    ax.bar(range(n_bins), bin_accs, color="#4CAF50", alpha=0.8)
+                    ax.set_xticks(range(n_bins))
+                    ax.set_xticklabels(bin_labels, rotation=30, ha="right")
+                    ax.set_xlabel("GC Content Range")
+                    ax.set_ylabel("Accuracy" if task_type == "classify" else "-MSE")
+                    ax.set_title("Performance by GC Content")
+                    ax.grid(axis="y", alpha=0.3)
+                    fig.tight_layout()
+                    fig.savefig(os.path.join(report_dir, "gc_bias.png"), dpi=150)
+                    plt.close(fig)
+        except Exception:
+            pass
+
+    # --- Sequence length bias analysis (T101) ---
+    len_path = os.path.join(CACHE_DIR, "sample_lengths.pt")
+    if os.path.exists(len_path) and results.get("predictions") is not None and results.get("targets") is not None:
+        try:
+            all_lens = torch.load(len_path, map_location="cpu", weights_only=True).numpy()
+            val_n = config.get("n_val", 0)
+            if len(all_lens) >= val_n and val_n > 0:
+                val_lens = all_lens[-val_n:]
+                preds_arr = np.array(results["predictions"])
+                targets_arr = np.array(results["targets"])
+                n_bins = min(5, len(val_lens) // 5)
+                if n_bins >= 2:
+                    bins = np.quantile(val_lens.astype(float), np.linspace(0, 1, n_bins + 1))
+                    bins[-1] += 1
+                    bin_labels = [f"{int(bins[i])}-{int(bins[i+1])}" for i in range(n_bins)]
+                    bin_accs = []
+                    for i in range(n_bins):
+                        mask = (val_lens >= bins[i]) & (val_lens < bins[i + 1])
+                        if mask.sum() > 0:
+                            if task_type == "classify":
+                                bin_accs.append(float((preds_arr[mask] == targets_arr[mask]).mean()))
+                            else:
+                                bin_accs.append(float(-np.mean((preds_arr[mask] - targets_arr[mask]) ** 2)))
+                        else:
+                            bin_accs.append(0)
+
+                    fig, ax = plt.subplots(figsize=(8, 5))
+                    ax.bar(range(n_bins), bin_accs, color="#2196F3", alpha=0.8)
+                    ax.set_xticks(range(n_bins))
+                    ax.set_xticklabels(bin_labels, rotation=30, ha="right")
+                    ax.set_xlabel("Sequence Length (tokens)")
+                    ax.set_ylabel("Accuracy" if task_type == "classify" else "-MSE")
+                    ax.set_title("Performance by Sequence Length")
+                    ax.grid(axis="y", alpha=0.3)
+                    fig.tight_layout()
+                    fig.savefig(os.path.join(report_dir, "length_bias.png"), dpi=150)
+                    plt.close(fig)
         except Exception:
             pass
 
