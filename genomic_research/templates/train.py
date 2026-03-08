@@ -3149,6 +3149,25 @@ if __name__ == "__main__":
                 results["per_position_accuracy"] = _per_pos_acc
                 avg_pos = sum(_per_pos_acc.values()) / len(_per_pos_acc)
                 print(f"Per-position accuracy: {len(_per_pos_acc)} positions, avg={avg_pos:.4f}")
+
+                # Nucleotide confusion matrix (A=5, T=6, C=7, G=8, N=9 for char tokenizer)
+                _nuc_labels = {5: 0, 6: 1, 7: 2, 8: 3, 9: 4}  # A, T, C, G, N
+                n_nucs = len(_nuc_labels)
+                _nuc_cm = np.zeros((n_nucs, n_nucs), dtype=np.int64)
+                _pp_preds = _pp_logits.argmax(dim=-1)  # (B, L)
+                _pp_valid = (_pp_labels != PAD_TOKEN_ID)
+                for _true_id, _true_idx in _nuc_labels.items():
+                    for _pred_id, _pred_idx in _nuc_labels.items():
+                        _nuc_cm[_true_idx, _pred_idx] = (
+                            (_pp_labels == _true_id) & (_pp_preds == _pred_id) & _pp_valid
+                        ).sum().item()
+                results["nucleotide_confusion"] = _nuc_cm.tolist()
+                # Per-nucleotide accuracy
+                _diag = np.diag(_nuc_cm)
+                _row_sums = _nuc_cm.sum(axis=1)
+                _nuc_acc = {["A","T","C","G","N"][i]: round(_diag[i] / max(_row_sums[i], 1), 4) for i in range(n_nucs)}
+                results["nucleotide_accuracy"] = _nuc_acc
+                print(f"Nucleotide accuracy: {_nuc_acc}")
         except Exception:
             pass
 

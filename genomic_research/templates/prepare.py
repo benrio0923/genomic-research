@@ -328,6 +328,191 @@ def compute_sequence_weights(sequences, n_clusters=None):
     return weights
 
 
+def load_gff_annotations(gff_path, seq_dict=None):
+    """Load GFF/GTF annotations and create per-position labels.
+
+    Args:
+        gff_path: Path to GFF3 or GTF file.
+        seq_dict: Optional dict mapping seq_id → sequence string (for length info).
+
+    Returns: dict mapping seq_id → list of (start, end, feature_type) tuples.
+    """
+    annotations = {}
+    with open(gff_path) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split("\t")
+            if len(parts) < 9:
+                continue
+            seq_id = parts[0]
+            feature_type = parts[2]  # gene, CDS, exon, etc.
+            try:
+                start = int(parts[3]) - 1  # GFF is 1-based
+                end = int(parts[4])        # GFF end is inclusive
+            except ValueError:
+                continue
+            annotations.setdefault(seq_id, []).append((start, end, feature_type))
+
+    n_features = sum(len(v) for v in annotations.values())
+    print(f"  GFF/GTF: loaded {n_features} features across {len(annotations)} sequences")
+    return annotations
+
+
+def gff_to_position_labels(annotations, seq_length, feature_types=None):
+    """Convert GFF annotations to per-position integer labels.
+
+    Args:
+        annotations: list of (start, end, feature_type) from load_gff_annotations.
+        seq_length: Length of the sequence.
+        feature_types: Optional list of feature types to include. Default: all types.
+
+    Returns: numpy array of shape (seq_length,) with integer labels.
+             0 = intergenic, 1+ = feature type index.
+    """
+    # Build feature type → label mapping
+    if feature_types is None:
+        all_types = sorted(set(ft for _, _, ft in annotations))
+    else:
+        all_types = list(feature_types)
+    type_to_label = {ft: i + 1 for i, ft in enumerate(all_types)}
+
+    labels = np.zeros(seq_length, dtype=np.int64)
+    for start, end, ft in annotations:
+        if ft in type_to_label:
+            s = max(0, start)
+            e = min(end, seq_length)
+            labels[s:e] = type_to_label[ft]
+
+    return labels, type_to_label
+
+
+def _clean_protein_sequence(seq):
+    """Clean protein sequence: uppercase, replace non-standard with X."""
+    seq = seq.upper().strip()
+    valid = set("ACDEFGHIKLMNPQRSTVWY")
+    return "".join(c if c in valid else "X" for c in seq)
+
+
+def detect_sequence_type(sequences, sample_size=10):
+    """Auto-detect if sequences are DNA or protein.
+
+    Returns: "dna" or "protein"
+    """
+    sample = [seq for _, seq in sequences[:sample_size]]
+    dna_chars = set("ATCGN")
+    protein_chars = set("ACDEFGHIKLMNPQRSTVWYX")
+
+    dna_score = 0
+    for seq in sample:
+        upper = seq.upper()
+        if len(upper) > 0:
+            dna_frac = sum(1 for c in upper if c in dna_chars) / len(upper)
+            dna_score += dna_frac
+
+    avg_dna = dna_score / max(len(sample), 1)
+    return "dna" if avg_dna > 0.85 else "protein"
+
+
+class ProteinTokenizer:
+    """Character-level protein tokenizer: 20 amino acids + X (unknown) + special tokens."""
+
+    AMINO_ACIDS = "ACDEFGHIKLMNPQRSTVWY"
+
+    def __init__(self):
+        self.char_to_id = {}
+        self.id_to_char = {}
+        for i, aa in enumerate(self.AMINO_ACIDS):
+            self.char_to_id[aa] = NUM_SPECIAL + i
+            self.id_to_char[NUM_SPECIAL + i] = aa
+        # X = unknown amino acid
+        self.char_to_id["X"] = NUM_SPECIAL + len(self.AMINO_ACIDS)
+        self.id_to_char[NUM_SPECIAL + len(self.AMINO_ACIDS)] = "X"
+        self.vocab_size = NUM_SPECIAL + len(self.AMINO_ACIDS) + 1  # 26
+
+    def encode(self, sequence):
+        return [self.char_to_id.get(c, UNK_TOKEN_ID) for c in sequence.upper()]
+
+    def decode(self, ids):
+        return "".join(self.id_to_char.get(i, "?") for i in ids if i >= NUM_SPECIAL)
+
+
+def load_vcf_variants(vcf_path, reference_seq=None):
+    """Load VCF variant file and optionally apply variants to a reference sequence.
+
+    Args:
+        vcf_path: Path to VCF file.
+        reference_seq: Optional reference sequence string to apply variants to.
+
+    Returns:
+        If reference_seq is provided: list of (sample_id, mutated_sequence) tuples.
+        If not: list of variant dicts with chrom, pos, ref, alt fields.
+    """
+    variants = []
+    samples = []
+    with open(vcf_path) as f:
+        for line in f:
+            line = line.strip()
+            if line.startswith("##"):
+                continue
+            if line.startswith("#CHROM"):
+                parts = line.split("\t")
+                if len(parts) > 9:
+                    samples = parts[9:]
+                continue
+            parts = line.split("\t")
+            if len(parts) < 5:
+                continue
+            try:
+                chrom = parts[0]
+                pos = int(parts[1]) - 1  # VCF is 1-based
+                ref = parts[3]
+                alt = parts[4].split(",")[0]  # take first alt allele
+                variant = {"chrom": chrom, "pos": pos, "ref": ref, "alt": alt}
+                # Parse genotypes if samples present
+                if samples and len(parts) > 9:
+                    gt_field = parts[8].split(":").index("GT") if "GT" in parts[8] else 0
+                    for i, gt_str in enumerate(parts[9:]):
+                        gt = gt_str.split(":")[gt_field] if ":" in gt_str else gt_str
+                        variant[f"sample_{i}"] = gt
+                variants.append(variant)
+            except (ValueError, IndexError):
+                continue
+
+    print(f"  VCF: loaded {len(variants)} variants")
+
+    if reference_seq is None:
+        return variants
+
+    # Apply variants to reference to generate sample sequences
+    ref_seq = list(reference_seq.upper())
+    sequences = []
+
+    if not samples:
+        # Single mutant sequence with all ALT alleles applied
+        mutant = ref_seq.copy()
+        for v in sorted(variants, key=lambda x: x["pos"], reverse=True):
+            p = v["pos"]
+            if 0 <= p < len(mutant):
+                mutant[p:p + len(v["ref"])] = list(v["alt"])
+        sequences.append(("mutant", _clean_sequence("".join(mutant))))
+    else:
+        # Per-sample sequences based on genotypes
+        for si, sample in enumerate(samples):
+            mutant = ref_seq.copy()
+            for v in sorted(variants, key=lambda x: x["pos"], reverse=True):
+                gt = v.get(f"sample_{si}", "0/0")
+                has_alt = "1" in gt.replace("|", "/").split("/")
+                if has_alt:
+                    p = v["pos"]
+                    if 0 <= p < len(mutant):
+                        mutant[p:p + len(v["ref"])] = list(v["alt"])
+            sequences.append((sample, _clean_sequence("".join(mutant))))
+
+    return sequences
+
+
 # ---------------------------------------------------------------------------
 # Tokenizers
 # ---------------------------------------------------------------------------
@@ -1793,6 +1978,51 @@ def _generate_pretrain_report(results, training_history, report_dir):
             fig.tight_layout()
             fig.savefig(os.path.join(report_dir, "token_accuracy_curve.png"), dpi=150)
             plt.close(fig)
+
+    # Nucleotide confusion matrix (per-base prediction accuracy)
+    per_pos_acc = results.get("per_position_accuracy")
+    if per_pos_acc:
+        try:
+            positions = sorted(per_pos_acc.keys())
+            accs = [per_pos_acc[p] for p in positions]
+            fig, ax = plt.subplots(figsize=(10, 4))
+            ax.bar(positions, accs, width=1.0, color="#4CAF50", alpha=0.7)
+            ax.set_xlabel("Position")
+            ax.set_ylabel("Token Accuracy")
+            ax.set_title("Per-Position Token Prediction Accuracy")
+            ax.set_ylim(0, 1.05)
+            ax.grid(True, alpha=0.3, axis="y")
+            fig.tight_layout()
+            fig.savefig(os.path.join(report_dir, "per_position_accuracy.png"), dpi=150)
+            plt.close(fig)
+        except Exception:
+            pass
+
+    # Nucleotide-level confusion matrix
+    nuc_confusion = results.get("nucleotide_confusion")
+    if nuc_confusion is not None:
+        try:
+            cm = np.array(nuc_confusion)
+            labels = ["A", "T", "C", "G", "N"][:cm.shape[0]]
+            fig, ax = plt.subplots(figsize=(6, 5))
+            im = ax.imshow(cm, interpolation="nearest", cmap="Blues")
+            ax.set_title("Nucleotide Prediction Confusion Matrix")
+            fig.colorbar(im, ax=ax, shrink=0.8)
+            ax.set_xticks(range(len(labels)))
+            ax.set_yticks(range(len(labels)))
+            ax.set_xticklabels(labels)
+            ax.set_yticklabels(labels)
+            ax.set_xlabel("Predicted")
+            ax.set_ylabel("True")
+            for i in range(len(labels)):
+                for j in range(len(labels)):
+                    ax.text(j, i, f"{cm[i, j]:.0f}", ha="center", va="center",
+                            color="white" if cm[i, j] > cm.max() / 2 else "black", fontsize=10)
+            fig.tight_layout()
+            fig.savefig(os.path.join(report_dir, "nucleotide_confusion.png"), dpi=150)
+            plt.close(fig)
+        except Exception:
+            pass
 
     # Text report
     lines = ["Pre-training Report", "=" * 40]
