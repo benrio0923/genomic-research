@@ -1112,25 +1112,75 @@ if __name__ == "__main__":
         print(f"Model EMA: decay={EMA_DECAY}")
 
     num_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Parameters: {_cyan(f'{num_params:,}')}")
+
+    # Model complexity analysis
+    def _model_complexity(model, seq_len, batch_size):
+        """Compute parameter breakdown, FLOPs estimate, and memory estimate."""
+        info = {"total_params": num_params, "trainable_params": trainable_params}
+
+        # Per-layer parameter breakdown
+        layer_params = {}
+        for name, p in model.named_parameters():
+            group = name.split(".")[0]
+            layer_params[group] = layer_params.get(group, 0) + p.numel()
+        info["layer_params"] = layer_params
+
+        # FLOPs estimate (rough: 2 * params * seq_len * batch_size for forward pass)
+        # Transformer attention: O(n^2 * d) per layer
+        flops_fwd = 2 * num_params * seq_len
+        if MODEL_TYPE == "transformer":
+            # Add attention QKV: 3 * d_model^2 * seq_len + seq_len^2 * d_model per layer
+            attn_flops = N_LAYERS * (3 * D_MODEL * D_MODEL * seq_len + seq_len * seq_len * D_MODEL)
+            flops_fwd += attn_flops
+        info["flops_forward"] = flops_fwd
+        info["flops_backward"] = flops_fwd * 2  # backward ≈ 2x forward
+
+        # Memory estimate
+        param_mem = num_params * 4  # fp32
+        grad_mem = trainable_params * 4
+        # Adam states: 2 * trainable_params * 4 (momentum + variance)
+        optim_mem = trainable_params * 8
+        # Activation memory (rough estimate)
+        act_mem = batch_size * seq_len * D_MODEL * N_LAYERS * 4
+        info["memory_params_mb"] = param_mem / 1024 / 1024
+        info["memory_gradients_mb"] = grad_mem / 1024 / 1024
+        info["memory_optimizer_mb"] = optim_mem / 1024 / 1024
+        info["memory_activations_mb"] = act_mem / 1024 / 1024
+        info["memory_total_mb"] = (param_mem + grad_mem + optim_mem + act_mem) / 1024 / 1024
+        return info
+
+    complexity = _model_complexity(model, config["max_length"], BATCH_SIZE)
 
     # --dry-run: print model info and exit without training
     if _DRY_RUN:
         print(f"\n{_bold('=== DRY RUN ===')} (no training)")
-        print(f"Model:      {MODEL_TYPE}")
-        print(f"Layers:     {N_LAYERS}")
-        print(f"d_model:    {D_MODEL}")
-        print(f"d_ff:       {D_FF}")
-        print(f"Heads:      {N_HEADS}")
-        print(f"Params:     {num_params:,}")
-        print(f"Objective:  {OBJECTIVE}")
-        print(f"LR:         {LEARNING_RATE}")
-        print(f"Batch:      {BATCH_SIZE}")
-        print(f"Schedule:   {LR_SCHEDULE}")
+        print(f"Model:       {MODEL_TYPE}")
+        print(f"Layers:      {N_LAYERS}")
+        print(f"d_model:     {D_MODEL}")
+        print(f"d_ff:        {D_FF}")
+        print(f"Heads:       {N_HEADS}")
+        print(f"Total params:     {num_params:,}")
+        print(f"Trainable params: {trainable_params:,}")
+        print(f"Objective:   {OBJECTIVE}")
+        print(f"LR:          {LEARNING_RATE}")
+        print(f"Batch:       {BATCH_SIZE}")
+        print(f"Schedule:    {LR_SCHEDULE}")
         print(f"Time budget: {TIME_BUDGET}s")
-        # Estimate memory (rough: 4 bytes per param * 3 for activations/gradients)
-        _est_mem_mb = num_params * 4 * 3 / 1024 / 1024
-        print(f"Est. memory: ~{_est_mem_mb:.0f} MB (fp32, rough estimate)")
+        print(f"\n{_bold('--- Complexity ---')}")
+        print(f"FLOPs (fwd):  {complexity['flops_forward']:,.0f}")
+        print(f"FLOPs (bwd):  {complexity['flops_backward']:,.0f}")
+        print(f"\n{_bold('--- Memory Estimate ---')}")
+        print(f"Parameters:   {complexity['memory_params_mb']:.1f} MB")
+        print(f"Gradients:    {complexity['memory_gradients_mb']:.1f} MB")
+        print(f"Optimizer:    {complexity['memory_optimizer_mb']:.1f} MB")
+        print(f"Activations:  {complexity['memory_activations_mb']:.1f} MB")
+        print(f"Total:        ~{complexity['memory_total_mb']:.0f} MB")
+        print(f"\n{_bold('--- Parameter Breakdown ---')}")
+        for group, count in sorted(complexity["layer_params"].items(), key=lambda x: -x[1]):
+            pct = 100 * count / num_params
+            print(f"  {group:20s} {count:>12,} ({pct:.1f}%)")
         sys.exit(0)
 
     # Build parameter groups with optional layer-wise LR decay
@@ -1698,8 +1748,11 @@ if __name__ == "__main__":
         "num_steps": step,
         "num_epochs": epoch,
         "num_params": num_params,
+        "trainable_params": trainable_params,
         "peak_vram_mb": round(peak_vram_mb, 1),
         "device": str(device),
+        "flops_forward": complexity.get("flops_forward", 0),
+        "memory_estimate_mb": round(complexity.get("memory_total_mb", 0), 1),
     }
 
     # Extract embeddings for t-SNE visualization

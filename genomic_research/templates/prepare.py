@@ -365,17 +365,56 @@ def load_tokenizer(path):
 # Data preparation
 # ---------------------------------------------------------------------------
 
-def _chunk_tokens(token_ids, max_length, overlap_ratio=CHUNK_OVERLAP):
-    """Split a long token sequence into overlapping chunks."""
+def _chunk_tokens(token_ids, max_length, overlap_ratio=CHUNK_OVERLAP, strategy="fixed"):
+    """Split a long token sequence into chunks.
+
+    Strategies:
+        fixed: fixed overlap ratio (default 50%)
+        none: no overlap, consecutive non-overlapping chunks
+        random: random start offset for each chunk
+        slide: sliding window with 1-token stride (generates many chunks)
+    """
     if len(token_ids) <= max_length:
         return [token_ids]
 
+    if strategy == "none":
+        # No overlap
+        chunks = []
+        for start in range(0, len(token_ids), max_length):
+            chunk = token_ids[start:start + max_length]
+            if len(chunk) < max_length // 4:
+                break
+            chunks.append(chunk)
+        return chunks
+
+    if strategy == "random":
+        # Random offset chunks
+        rng = np.random.RandomState(42)
+        n_chunks = max(1, len(token_ids) // max_length)
+        chunks = []
+        for _ in range(n_chunks):
+            start = rng.randint(0, max(1, len(token_ids) - max_length))
+            chunks.append(token_ids[start:start + max_length])
+        return chunks
+
+    if strategy == "slide":
+        # Sliding window with small stride (max_length // 4)
+        stride = max(1, max_length // 4)
+        chunks = []
+        for start in range(0, len(token_ids) - max_length // 4, stride):
+            chunk = token_ids[start:start + max_length]
+            if len(chunk) < max_length // 4:
+                break
+            chunks.append(chunk)
+        return chunks
+
+    # Default: fixed overlap
     stride = max(1, int(max_length * (1 - overlap_ratio)))
     chunks = []
     for start in range(0, len(token_ids), stride):
         chunk = token_ids[start:start + max_length]
         if len(chunk) < max_length // 4:
-            break  # skip very short trailing chunks
+            break
         chunks.append(chunk)
     return chunks
 
@@ -400,6 +439,8 @@ def prepare_data(
     sample_n=0,
     sample_frac=0.0,
     rc_double=False,
+    chunk_strategy="fixed",
+    n_folds=1,
 ):
     """
     Prepare genomic data for training.
@@ -575,7 +616,7 @@ def prepare_data(
 
     if task_type == "pretrain":
         for sid, tokens in tokenized:
-            chunks = _chunk_tokens(tokens, max_length)
+            chunks = _chunk_tokens(tokens, max_length, strategy=chunk_strategy)
             for chunk in chunks:
                 all_token_ids.append(chunk)
         print(f"  Created {len(all_token_ids)} chunks from {len(tokenized)} sequences")
@@ -589,7 +630,7 @@ def prepare_data(
                 label = labels_map.get(sid, 0 if task_type == "classify" else 0.0)
 
             if len(tokens) > max_length:
-                chunks = _chunk_tokens(tokens, max_length)
+                chunks = _chunk_tokens(tokens, max_length, strategy=chunk_strategy)
                 n_chunked += 1
             else:
                 chunks = [tokens]
@@ -649,6 +690,26 @@ def prepare_data(
         torch.save(torch.from_numpy(train_labels), os.path.join(CACHE_DIR, "train_labels.pt"))
         torch.save(torch.from_numpy(val_labels), os.path.join(CACHE_DIR, "val_labels.pt"))
 
+    # K-fold cross-validation indices (optional)
+    if n_folds > 1:
+        from sklearn.model_selection import KFold, StratifiedKFold
+        if task_type == "classify" and all_labels:
+            kf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=RANDOM_SEED)
+            splits = list(kf.split(padded, np.array(all_labels, dtype=np.int64)))
+        else:
+            kf = KFold(n_splits=n_folds, shuffle=True, random_state=RANDOM_SEED)
+            splits = list(kf.split(padded))
+        fold_indices = {"n_folds": n_folds, "folds": []}
+        for fold_i, (tr_idx, vl_idx) in enumerate(splits):
+            fold_indices["folds"].append({
+                "train": tr_idx.tolist(),
+                "val": vl_idx.tolist(),
+            })
+        fold_path = os.path.join(CACHE_DIR, "fold_indices.json")
+        with open(fold_path, "w") as f:
+            json.dump(fold_indices, f)
+        print(f"  Saved {n_folds}-fold CV indices to {fold_path}")
+
     # Save tokenizer
     tokenizer.save(os.path.join(CACHE_DIR, "tokenizer.json"))
 
@@ -663,6 +724,8 @@ def prepare_data(
         "n_val": int(len(val_tokens)),
         "n_sequences": len(sequences),
         "kmer_size": kmer_size if tokenizer_type == "kmer" else None,
+        "n_folds": n_folds,
+        "chunk_strategy": chunk_strategy,
     }
 
     if task_type == "classify":
@@ -736,6 +799,62 @@ def load_data(device="cpu"):
     if os.path.exists(labels_path):
         data["train_labels"] = torch.load(labels_path, map_location=device, weights_only=True)
         data["val_labels"] = torch.load(os.path.join(CACHE_DIR, "val_labels.pt"), map_location=device, weights_only=True)
+
+    return data
+
+
+def load_fold(fold_idx, device="cpu"):
+    """Load train/val data for a specific k-fold CV split.
+
+    Returns the same dict structure as load_data(), but with fold-specific
+    train/val indices applied to the full dataset.
+
+    Args:
+        fold_idx: 0-based fold index.
+        device: torch device for tensors.
+    """
+    fold_path = os.path.join(CACHE_DIR, "fold_indices.json")
+    if not os.path.exists(fold_path):
+        raise FileNotFoundError(
+            "No fold indices found. Re-run prepare.py with --n-folds > 1."
+        )
+    with open(fold_path) as f:
+        fold_info = json.load(f)
+
+    n_folds = fold_info["n_folds"]
+    if fold_idx < 0 or fold_idx >= n_folds:
+        raise ValueError(f"fold_idx={fold_idx} out of range [0, {n_folds})")
+
+    train_idx = fold_info["folds"][fold_idx]["train"]
+    val_idx = fold_info["folds"][fold_idx]["val"]
+
+    # Load full dataset (train + val combined)
+    all_tokens = torch.cat([
+        torch.load(os.path.join(CACHE_DIR, "train_tokens.pt"), map_location=device, weights_only=True),
+        torch.load(os.path.join(CACHE_DIR, "val_tokens.pt"), map_location=device, weights_only=True),
+    ])
+    all_mask = torch.cat([
+        torch.load(os.path.join(CACHE_DIR, "train_mask.pt"), map_location=device, weights_only=True),
+        torch.load(os.path.join(CACHE_DIR, "val_mask.pt"), map_location=device, weights_only=True),
+    ])
+
+    data = {
+        "train_tokens": all_tokens[train_idx],
+        "val_tokens": all_tokens[val_idx],
+        "train_mask": all_mask[train_idx],
+        "val_mask": all_mask[val_idx],
+    }
+
+    # Load labels if they exist
+    train_labels_path = os.path.join(CACHE_DIR, "train_labels.pt")
+    val_labels_path = os.path.join(CACHE_DIR, "val_labels.pt")
+    if os.path.exists(train_labels_path) and os.path.exists(val_labels_path):
+        all_labels = torch.cat([
+            torch.load(train_labels_path, map_location=device, weights_only=True),
+            torch.load(val_labels_path, map_location=device, weights_only=True),
+        ])
+        data["train_labels"] = all_labels[train_idx]
+        data["val_labels"] = all_labels[val_idx]
 
     return data
 
@@ -1380,6 +1499,11 @@ if __name__ == "__main__":
     parser.add_argument("--sample-n", type=int, default=0, help="Subsample to N sequences (0 = no sampling)")
     parser.add_argument("--sample-frac", type=float, default=0.0, help="Subsample fraction 0-1 (0 = no sampling)")
     parser.add_argument("--rc-double", action="store_true", help="Double dataset with reverse complement sequences")
+    parser.add_argument("--chunk-strategy", type=str, default="fixed",
+                        choices=["fixed", "none", "random", "slide"],
+                        help="Chunking strategy for long sequences (default: fixed)")
+    parser.add_argument("--n-folds", type=int, default=1,
+                        help="Number of CV folds (default: 1 = no CV, just train/val split)")
     args = parser.parse_args()
 
     seq_path = args.fasta or args.csv
@@ -1403,6 +1527,8 @@ if __name__ == "__main__":
         sample_n=args.sample_n,
         sample_frac=args.sample_frac,
         rc_double=args.rc_double,
+        chunk_strategy=args.chunk_strategy,
+        n_folds=args.n_folds,
     )
 
     print()
