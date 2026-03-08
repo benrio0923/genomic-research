@@ -154,6 +154,12 @@ USE_CUTMIX = _cfg("use_cutmix", False)                   # CutMix augmentation f
 CUTMIX_ALPHA = _cfg("cutmix_alpha", 1.0)                 # Beta distribution alpha for CutMix
 USE_CURRICULUM = _cfg("use_curriculum", False)            # curriculum learning: start short, increase length
 CURRICULUM_START_RATIO = _cfg("curriculum_start_ratio", 0.25)  # start at 25% of max_length
+USE_RDROP = _cfg("use_rdrop", False)                     # R-Drop: KL divergence between two dropout passes
+RDROP_ALPHA = _cfg("rdrop_alpha", 1.0)                   # weight for R-Drop KL loss
+USE_SAM = _cfg("use_sam", False)                         # Sharpness-Aware Minimization
+SAM_RHO = _cfg("sam_rho", 0.05)                          # SAM perturbation radius
+USE_CONTRASTIVE = _cfg("use_contrastive", False)         # contrastive learning (SimCLR-style)
+CONTRASTIVE_TEMP = _cfg("contrastive_temp", 0.07)        # temperature for InfoNCE loss
 
 # ---------------------------------------------------------------------------
 # Data augmentation utilities
@@ -393,6 +399,67 @@ def cutmix_tokens(tokens, mask, labels, alpha=1.0):
     return mixed_tokens, mixed_mask, labels, labels[perm], actual_lam
 
 
+def contrastive_loss(z1, z2, temperature=0.07):
+    """InfoNCE / SimCLR contrastive loss.
+
+    z1, z2: (B, D) embeddings of positive pairs.
+    """
+    z1 = nn.functional.normalize(z1, dim=-1)
+    z2 = nn.functional.normalize(z2, dim=-1)
+    B = z1.size(0)
+    # Cosine similarity matrix
+    logits = torch.mm(z1, z2.t()) / temperature  # (B, B)
+    labels = torch.arange(B, device=z1.device)
+    loss = (nn.functional.cross_entropy(logits, labels)
+            + nn.functional.cross_entropy(logits.t(), labels)) / 2
+    return loss
+
+
+def denoise_corrupt(tokens, mask, num_special, delete_rate=0.1, shuffle_rate=0.1, insert_rate=0.05):
+    """Corrupt sequences for denoising autoencoder: random deletion, shuffling, insertion.
+
+    Returns corrupted input and original tokens as targets.
+    """
+    B, L = tokens.shape
+    corrupted = tokens.clone()
+
+    for i in range(B):
+        seq_len = mask[i].sum().item()
+        if seq_len < 4:
+            continue
+        valid = torch.arange(seq_len, device=tokens.device)
+
+        # 1. Random deletion: remove tokens and shift left
+        n_delete = max(0, int(seq_len * delete_rate))
+        if n_delete > 0:
+            del_idx = valid[torch.randperm(seq_len, device=tokens.device)[:n_delete]]
+            keep_mask = torch.ones(L, dtype=torch.bool, device=tokens.device)
+            keep_mask[del_idx] = False
+            kept = corrupted[i][keep_mask]
+            corrupted[i] = torch.nn.functional.pad(kept, (0, L - kept.size(0)), value=PAD_TOKEN_ID)
+
+        # 2. Local shuffling within 3-token windows
+        new_seq_len = mask[i].sum().item() - n_delete
+        n_shuffle = max(0, int(new_seq_len * shuffle_rate))
+        if n_shuffle > 0 and new_seq_len > 2:
+            for _ in range(n_shuffle):
+                j = torch.randint(0, max(1, new_seq_len - 1), (1,)).item()
+                if j + 1 < L and corrupted[i, j] >= num_special and corrupted[i, j + 1] >= num_special:
+                    corrupted[i, j], corrupted[i, j + 1] = corrupted[i, j + 1].clone(), corrupted[i, j].clone()
+
+        # 3. Random insertion: insert random base tokens
+        n_insert = max(0, int(seq_len * insert_rate))
+        if n_insert > 0 and new_seq_len + n_insert <= L:
+            for _ in range(n_insert):
+                pos = torch.randint(0, max(1, new_seq_len), (1,)).item()
+                rand_token = torch.randint(num_special, num_special + 4, (1,), device=tokens.device).item()
+                # Shift right and insert
+                corrupted[i, pos + 1:] = corrupted[i, pos:-1].clone()
+                corrupted[i, pos] = rand_token
+
+    return corrupted
+
+
 # ---------------------------------------------------------------------------
 # Model — Transformer Encoder (agent can replace entirely)
 # ---------------------------------------------------------------------------
@@ -571,6 +638,63 @@ class LAMB(torch.optim.Optimizer):
                 u_norm = update.norm(2)
                 trust = p_norm / u_norm if p_norm > 0 and u_norm > 0 else 1.0
                 p.add_(update, alpha=-group["lr"] * trust)
+
+
+class SAM(torch.optim.Optimizer):
+    """Sharpness-Aware Minimization (Foret et al., 2021).
+
+    Wraps a base optimizer. Each step: (1) perturb weights by rho * grad_norm,
+    (2) compute gradient at perturbed point, (3) step with base optimizer.
+    """
+
+    def __init__(self, params, base_optimizer_cls, rho=0.05, **kwargs):
+        defaults = dict(rho=rho)
+        super().__init__(params, defaults)
+        self.base_optimizer = base_optimizer_cls(self.param_groups, **kwargs)
+        self.param_groups = self.base_optimizer.param_groups
+
+    @torch.no_grad()
+    def first_step(self):
+        """Ascent step: perturb weights toward sharpest direction."""
+        grad_norm = self._grad_norm()
+        for group in self.param_groups:
+            scale = group["rho"] / (grad_norm + 1e-12)
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                e_w = p.grad * scale
+                p.add_(e_w)
+                self.state[p]["e_w"] = e_w
+
+    @torch.no_grad()
+    def second_step(self):
+        """Descent step: revert perturbation and update with base optimizer."""
+        for group in self.param_groups:
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                p.sub_(self.state[p]["e_w"])
+        self.base_optimizer.step()
+
+    def _grad_norm(self):
+        shared_device = self.param_groups[0]["params"][0].device
+        norm = torch.norm(
+            torch.stack([
+                p.grad.norm(p=2).to(shared_device)
+                for group in self.param_groups
+                for p in group["params"]
+                if p.grad is not None
+            ]),
+            p=2,
+        )
+        return norm
+
+    def step(self, closure=None):
+        """Standard step (used when SAM is not active)."""
+        self.base_optimizer.step(closure)
+
+    def zero_grad(self, set_to_none=False):
+        self.base_optimizer.zero_grad(set_to_none)
 
 
 class DropPath(nn.Module):
@@ -1612,7 +1736,15 @@ if __name__ == "__main__":
     _param_groups = _get_param_groups(model, LEARNING_RATE, WEIGHT_DECAY, LR_LAYER_DECAY)
 
     # Optimizer
-    if OPTIMIZER == "sgd":
+    if USE_SAM:
+        if OPTIMIZER == "sgd":
+            optimizer = SAM(_param_groups, torch.optim.SGD, rho=SAM_RHO, lr=LEARNING_RATE, momentum=0.9)
+        elif OPTIMIZER == "lamb":
+            optimizer = SAM(_param_groups, LAMB, rho=SAM_RHO, lr=LEARNING_RATE)
+        else:
+            optimizer = SAM(_param_groups, torch.optim.AdamW, rho=SAM_RHO, lr=LEARNING_RATE)
+        print(f"SAM: enabled (rho={SAM_RHO})")
+    elif OPTIMIZER == "sgd":
         optimizer = torch.optim.SGD(_param_groups, lr=LEARNING_RATE, momentum=0.9)
     elif OPTIMIZER == "lamb":
         optimizer = LAMB(_param_groups, lr=LEARNING_RATE)
@@ -1873,6 +2005,13 @@ if __name__ == "__main__":
                             logits = model(input_ids, attention_mask=mask_batch)
                             loss = criterion(logits.reshape(-1, vocab_size), labels.reshape(-1))
 
+                    elif OBJECTIVE == "denoise":
+                        # Denoising autoencoder: corrupt input, predict original
+                        corrupted = denoise_corrupt(tokens_batch, mask_batch, NUM_SPECIAL)
+                        with torch.amp.autocast(amp_device, enabled=amp_enabled, dtype=amp_dtype):
+                            logits = model(corrupted, attention_mask=mask_batch)
+                            loss = criterion(logits.reshape(-1, vocab_size), tokens_batch.reshape(-1))
+
                     else:  # CLM
                         input_ids = tokens_batch[:, :-1]
                         target_ids = tokens_batch[:, 1:]
@@ -1881,6 +2020,34 @@ if __name__ == "__main__":
                         with torch.amp.autocast(amp_device, enabled=amp_enabled, dtype=amp_dtype):
                             logits = model(input_ids, attention_mask=input_mask)
                             loss = criterion(logits.reshape(-1, vocab_size), target_ids.reshape(-1))
+
+                    # R-Drop: KL divergence between two forward passes with dropout
+                    if USE_RDROP and model.training:
+                        with torch.amp.autocast(amp_device, enabled=amp_enabled, dtype=amp_dtype):
+                            if OBJECTIVE in ("mlm", "denoise"):
+                                _inp = corrupted if OBJECTIVE == "denoise" else input_ids
+                                logits2 = model(_inp, attention_mask=mask_batch)
+                            else:
+                                logits2 = model(input_ids, attention_mask=input_mask)
+                            p = torch.log_softmax(logits.reshape(-1, vocab_size), dim=-1)
+                            q = torch.log_softmax(logits2.reshape(-1, vocab_size), dim=-1)
+                            kl = nn.functional.kl_div(p, q.exp(), reduction="batchmean") + \
+                                 nn.functional.kl_div(q, p.exp(), reduction="batchmean")
+                            loss = loss + RDROP_ALPHA * kl / 2
+
+                    # Contrastive learning: augment and compute InfoNCE loss
+                    if USE_CONTRASTIVE and model.training and hasattr(model, 'embedding'):
+                        with torch.amp.autocast(amp_device, enabled=amp_enabled, dtype=amp_dtype):
+                            # View 1: original embeddings with mean pooling
+                            emb1 = model.embedding(tokens_batch)
+                            m1 = mask_batch.unsqueeze(-1).float()
+                            z1 = (emb1 * m1).sum(dim=1) / m1.sum(dim=1).clamp(min=1)
+                            # View 2: augmented (SNP noise + dropout gives different view)
+                            aug_tokens = snp_noise(tokens_batch.clone(), mask_batch, 0.05, NUM_SPECIAL)
+                            emb2 = model.embedding(aug_tokens)
+                            z2 = (emb2 * m1).sum(dim=1) / m1.sum(dim=1).clamp(min=1)
+                            cl_loss = contrastive_loss(z1, z2, CONTRASTIVE_TEMP)
+                            loss = loss + 0.1 * cl_loss
 
                 # Scale loss for gradient accumulation
                 loss = loss / GRAD_ACCUM_STEPS
@@ -1924,7 +2091,31 @@ if __name__ == "__main__":
                             if p.grad is not None:
                                 p.grad.add_(torch.randn_like(p.grad) * _noise_std)
 
-                    if scaler is not None:
+                    if USE_SAM and scaler is None:
+                        # SAM: first step (ascend), then recompute grads, then second step (descend)
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                        optimizer.first_step()
+                        optimizer.zero_grad()
+                        # Re-forward and backward at perturbed point
+                        with torch.amp.autocast(amp_device, enabled=amp_enabled, dtype=amp_dtype):
+                            if task_type in ("classify", "regress"):
+                                output2 = model(tokens_batch, attention_mask=mask_batch)
+                                if task_type == "regress":
+                                    output2 = output2.squeeze(-1)
+                                loss2 = criterion(output2, labels_batch) / GRAD_ACCUM_STEPS
+                            elif OBJECTIVE == "mlm" or OBJECTIVE == "denoise":
+                                _inp2 = corrupted if OBJECTIVE == "denoise" else input_ids
+                                logits2_sam = model(_inp2, attention_mask=mask_batch)
+                                loss2 = criterion(logits2_sam.reshape(-1, vocab_size),
+                                                  (tokens_batch if OBJECTIVE == "denoise" else labels).reshape(-1)) / GRAD_ACCUM_STEPS
+                            else:
+                                logits2_sam = model(input_ids, attention_mask=input_mask)
+                                loss2 = criterion(logits2_sam.reshape(-1, vocab_size), target_ids.reshape(-1)) / GRAD_ACCUM_STEPS
+                        loss2.backward()
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                        optimizer.second_step()
+                        optimizer.zero_grad()
+                    elif scaler is not None:
                         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                         scaler.step(optimizer)
                         scaler.update()
