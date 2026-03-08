@@ -692,6 +692,158 @@ class TestCheckpointRoundtrip:
         os.remove(ckpt_path)
 
 
+class TestFASTQFiltering:
+    """T22: Test FASTQ quality filtering."""
+
+    def test_load_fastq(self, tmp_path):
+        """Generate synthetic FASTQ and verify loading."""
+        import random
+        random.seed(42)
+        fq_path = tmp_path / "test.fastq"
+        with open(fq_path, "w") as f:
+            for i in range(20):
+                length = random.randint(50, 100)
+                seq = "".join(random.choice("ATCG") for _ in range(length))
+                qual = "I" * length  # high quality (Phred ~40)
+                f.write(f"@seq_{i}\n{seq}\n+\n{qual}\n")
+
+        sys.path.insert(0, str(Path(__file__).parent.parent / "genomic_research" / "templates"))
+        from prepare import load_sequences
+        seqs = load_sequences(str(fq_path))
+        assert len(seqs) == 20
+        for sid, seq in seqs:
+            assert len(seq) > 0
+            assert all(c in "ATCGN" for c in seq)
+
+    def test_fastq_low_quality_filtered(self, tmp_path):
+        """Verify low-quality sequences are filtered when min_quality is set."""
+        fq_path = tmp_path / "lowqual.fastq"
+        with open(fq_path, "w") as f:
+            # High quality read
+            f.write("@good_read\nATCGATCG\n+\nIIIIIIII\n")
+            # Low quality read (Phred ~2)
+            f.write("@bad_read\nATCGATCG\n+\n########\n")
+
+        sys.path.insert(0, str(Path(__file__).parent.parent / "genomic_research" / "templates"))
+        from prepare import _load_fastq
+        # With min_quality filter
+        seqs = _load_fastq(str(fq_path), min_quality=20)
+        # At least the good read should pass
+        assert len(seqs) >= 1
+        good_ids = [s[0] for s in seqs]
+        assert "good_read" in good_ids
+
+
+class TestStratifiedSplit:
+    """T24: Test stratified split for classification."""
+
+    def test_all_classes_in_splits(self, tmp_path):
+        """Verify each class appears in both train and val sets."""
+        import random
+        random.seed(42)
+        csv_path = tmp_path / "imbalanced.csv"
+        with open(csv_path, "w") as f:
+            f.write("id,sequence,label\n")
+            labels = ["A"] * 100 + ["B"] * 10 + ["C"] * 5
+            random.shuffle(labels)
+            for i, label in enumerate(labels):
+                seq = "".join(random.choice("ATCG") for _ in range(60))
+                f.write(f"seq_{i},{seq},{label}\n")
+
+        sys.path.insert(0, str(Path(__file__).parent.parent / "genomic_research" / "templates"))
+        from prepare import prepare_data, CACHE_DIR
+        import shutil
+        if os.path.exists(CACHE_DIR):
+            shutil.rmtree(CACHE_DIR)
+
+        config = prepare_data(
+            seq_path=str(csv_path),
+            task_type="classify",
+            tokenizer_type="char",
+            max_length=64,
+            seq_col="sequence",
+            label_col="label",
+        )
+        assert config["n_classes"] == 3
+        assert config["n_train"] > 0
+        assert config["n_val"] > 0
+
+        import torch
+        train_labels = torch.load(os.path.join(CACHE_DIR, "train_labels.pt"),
+                                  map_location="cpu", weights_only=True)
+        val_labels = torch.load(os.path.join(CACHE_DIR, "val_labels.pt"),
+                                map_location="cpu", weights_only=True)
+        train_unique = set(train_labels.numpy().tolist())
+        val_unique = set(val_labels.numpy().tolist())
+        # Each class should appear in both splits
+        assert len(train_unique) == 3, f"Train missing classes: {train_unique}"
+        assert len(val_unique) == 3, f"Val missing classes: {val_unique}"
+
+        shutil.rmtree(CACHE_DIR)
+
+
+class TestClassWeights:
+    """T25: Test class weights computation."""
+
+    def test_weights_inversely_proportional(self, tmp_path):
+        """Verify weights are inversely proportional to class frequency."""
+        import random
+        random.seed(42)
+        csv_path = tmp_path / "weighted.csv"
+        with open(csv_path, "w") as f:
+            f.write("id,sequence,label\n")
+            # Class A: 80, B: 15, C: 5
+            labels = ["A"] * 80 + ["B"] * 15 + ["C"] * 5
+            random.shuffle(labels)
+            for i, label in enumerate(labels):
+                seq = "".join(random.choice("ATCG") for _ in range(60))
+                f.write(f"seq_{i},{seq},{label}\n")
+
+        sys.path.insert(0, str(Path(__file__).parent.parent / "genomic_research" / "templates"))
+        from prepare import prepare_data, CACHE_DIR, CONFIG_PATH
+        import shutil
+        if os.path.exists(CACHE_DIR):
+            shutil.rmtree(CACHE_DIR)
+
+        config = prepare_data(
+            seq_path=str(csv_path),
+            task_type="classify",
+            tokenizer_type="char",
+            max_length=64,
+            seq_col="sequence",
+            label_col="label",
+        )
+        assert "class_weights" in config
+        weights = config["class_weights"]
+        assert len(weights) == 3
+        # The rare class should have the highest weight
+        # Weights are total / (n_classes * count)
+        # So the smallest class gets the largest weight
+        assert max(weights) > min(weights), "Rare class should have higher weight"
+
+        shutil.rmtree(CACHE_DIR)
+
+
+class TestMultiFileInput:
+    """T28: Test multi-file input."""
+
+    def test_directory_input(self, tmp_path):
+        """Test loading sequences from a directory of FASTA files."""
+        import random
+        random.seed(42)
+        for j in range(3):
+            fasta_path = tmp_path / f"batch_{j}.fasta"
+            with open(fasta_path, "w") as f:
+                for i in range(10):
+                    seq = "".join(random.choice("ATCG") for _ in range(100))
+                    f.write(f">seq_{j}_{i}\n{seq}\n")
+
+        sys.path.insert(0, str(Path(__file__).parent.parent / "genomic_research" / "templates"))
+        from prepare import load_sequences
+        seqs = load_sequences(str(tmp_path))
+        assert len(seqs) == 30, f"Expected 30 sequences from 3 files, got {len(seqs)}"
+
+
 class TestEdgeCases:
     """Test edge cases and error handling."""
 
