@@ -68,6 +68,12 @@ MODEL_ARCHITECTURES = {
         "pros": "Captures patterns at multiple scales simultaneously",
         "cons": "More parameters than single-scale CNN",
     },
+    "hyena": {
+        "description": "Hyena (long convolution via FFT + gating)",
+        "params": "d_model, d_ff, n_layers",
+        "pros": "Sub-quadratic complexity, good for long sequences (HyenaDNA-inspired)",
+        "cons": "Requires FFT, newer architecture with less community support",
+    },
 }
 
 

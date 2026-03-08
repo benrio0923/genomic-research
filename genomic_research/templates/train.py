@@ -162,6 +162,12 @@ USE_CONTRASTIVE = _cfg("use_contrastive", False)         # contrastive learning 
 CONTRASTIVE_TEMP = _cfg("contrastive_temp", 0.07)        # temperature for InfoNCE loss
 MULTI_LABEL = _cfg("multi_label", False)                 # multi-label classification (sigmoid per class)
 DYNAMIC_BATCH = _cfg("dynamic_batch", False)             # increase batch size over training
+USE_PROGRESSIVE_RESIZE = _cfg("use_progressive_resize", False)  # start with shorter seqs, grow over training
+PROGRESSIVE_START_LEN = _cfg("progressive_start_len", 64)       # initial sequence length for progressive resize
+USE_DISTILLATION = _cfg("use_distillation", False)              # knowledge distillation from teacher model
+TEACHER_CHECKPOINT = _cfg("teacher_checkpoint", "")             # path to teacher checkpoint (.pt)
+DISTILL_ALPHA = _cfg("distill_alpha", 0.5)                      # weight for distillation loss (vs task loss)
+DISTILL_TEMP = _cfg("distill_temp", 2.0)                        # temperature for soft targets
 
 # ---------------------------------------------------------------------------
 # Data augmentation utilities
@@ -415,6 +421,35 @@ def contrastive_loss(z1, z2, temperature=0.07):
     loss = (nn.functional.cross_entropy(logits, labels)
             + nn.functional.cross_entropy(logits.t(), labels)) / 2
     return loss
+
+
+def distillation_loss(student_logits, teacher_logits, temperature=2.0):
+    """KL divergence loss for knowledge distillation with temperature scaling."""
+    T = temperature
+    s_log_probs = nn.functional.log_softmax(student_logits / T, dim=-1)
+    t_probs = nn.functional.softmax(teacher_logits / T, dim=-1)
+    return nn.functional.kl_div(s_log_probs, t_probs, reduction="batchmean") * (T * T)
+
+
+def per_position_accuracy(logits, labels, pad_id=0, max_positions=512):
+    """Compute per-position token prediction accuracy.
+
+    Returns dict mapping position index → accuracy at that position.
+    Only counts positions where labels != pad_id.
+    """
+    # logits: (B, L, V), labels: (B, L)
+    preds = logits.argmax(dim=-1)  # (B, L)
+    correct = (preds == labels)    # (B, L)
+    valid = (labels != pad_id)     # (B, L)
+
+    L = min(logits.size(1), max_positions)
+    pos_acc = {}
+    for pos in range(L):
+        v = valid[:, pos]
+        n = v.sum().item()
+        if n > 0:
+            pos_acc[pos] = (correct[:, pos] & v).sum().item() / n
+    return pos_acc
 
 
 def denoise_corrupt(tokens, mask, num_special, delete_rate=0.1, shuffle_rate=0.1, insert_rate=0.05):
@@ -1339,6 +1374,135 @@ class GenomicLSTM(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# Hyena architecture (long convolution + gating)
+# ---------------------------------------------------------------------------
+
+class HyenaBlock(nn.Module):
+    """Hyena block: long convolution with implicit parameterization + gating.
+
+    Inspired by HyenaDNA (Nguyen et al., 2023). Sub-quadratic complexity.
+    """
+
+    def __init__(self, d_model, order=2, filter_size=64, dropout=0.0):
+        super().__init__()
+        self.order = order
+        self.d_model = d_model
+        self.norm = nn.LayerNorm(d_model)
+
+        # Input projections: (order+1) linear projections for gates and value
+        self.in_proj = nn.Linear(d_model, d_model * (order + 1))
+
+        # Implicit long convolution filters (learnable, one per order)
+        self.filters = nn.ParameterList([
+            nn.Parameter(torch.randn(1, d_model, filter_size) * 0.02)
+            for _ in range(order)
+        ])
+        self.filter_norms = nn.ModuleList([nn.LayerNorm(d_model) for _ in range(order)])
+
+        self.out_proj = nn.Linear(d_model, d_model)
+        self.drop = nn.Dropout(dropout)
+
+    def _long_conv(self, x, filt):
+        """Apply long convolution via FFT for efficiency."""
+        B, D, L = x.shape
+        filt_len = filt.size(-1)
+
+        # Pad filter to match sequence length
+        if filt_len < L:
+            filt = nn.functional.pad(filt, (0, L - filt_len))
+        elif filt_len > L:
+            filt = filt[:, :, :L]
+
+        # FFT-based convolution: O(n log n)
+        x_f = torch.fft.rfft(x, n=2 * L, dim=-1)
+        f_f = torch.fft.rfft(filt.expand(B, -1, -1), n=2 * L, dim=-1)
+        out = torch.fft.irfft(x_f * f_f, n=2 * L, dim=-1)[:, :, :L]
+        return out
+
+    def forward(self, x):
+        # x: (B, L, D)
+        h = self.norm(x)
+        # Project to (order+1) * d_model
+        z = self.in_proj(h)  # (B, L, D*(order+1))
+        chunks = z.chunk(self.order + 1, dim=-1)  # list of (B, L, D)
+        v = chunks[0]  # value
+        gates = chunks[1:]  # order gate projections
+
+        # Iterative gated long convolution
+        y = v.transpose(1, 2)  # (B, D, L) for conv
+        for i in range(self.order):
+            # Long convolution
+            y = self._long_conv(y, self.filters[i])
+            y = self.filter_norms[i](y.transpose(1, 2)).transpose(1, 2)
+            # Element-wise gating
+            y = y * gates[i].transpose(1, 2)
+
+        out = y.transpose(1, 2)  # (B, L, D)
+        out = self.out_proj(out)
+        return x + self.drop(out)
+
+
+class GenomicHyena(nn.Module):
+    """Hyena model for genomic sequences. Sub-quadratic via long convolutions."""
+
+    def __init__(self, vocab_size, d_model, n_layers, d_ff, max_len, dropout,
+                 task_type, n_classes=None, hyena_order=2, filter_size=64):
+        super().__init__()
+        self.task_type = task_type
+        self.d_model = d_model
+
+        self.embedding = nn.Embedding(vocab_size, d_model, padding_idx=PAD_TOKEN_ID)
+        self.emb_dropout = nn.Dropout(dropout)
+
+        self.blocks = nn.ModuleList()
+        for _ in range(n_layers):
+            self.blocks.append(HyenaBlock(d_model, order=hyena_order,
+                                          filter_size=min(filter_size, max_len), dropout=dropout))
+            # Add a feed-forward block
+            self.blocks.append(nn.Sequential(
+                nn.LayerNorm(d_model),
+                nn.Linear(d_model, d_ff), nn.GELU(), nn.Dropout(dropout),
+                nn.Linear(d_ff, d_model), nn.Dropout(dropout),
+            ))
+
+        self.ln = nn.LayerNorm(d_model)
+
+        if task_type == "pretrain":
+            self.head = nn.Linear(d_model, vocab_size)
+        elif task_type == "classify":
+            self.head = nn.Sequential(
+                nn.Linear(d_model, d_model), nn.GELU(), nn.Dropout(dropout),
+                nn.Linear(d_model, n_classes),
+            )
+        elif task_type == "regress":
+            self.head = nn.Sequential(
+                nn.Linear(d_model, d_model), nn.GELU(), nn.Dropout(dropout),
+                nn.Linear(d_model, 1),
+            )
+
+    def forward(self, input_ids, attention_mask=None):
+        x = self.embedding(input_ids)
+        x = self.emb_dropout(x)
+
+        for block in self.blocks:
+            if isinstance(block, HyenaBlock):
+                x = block(x)
+            else:
+                x = x + block(x)  # FF residual
+        x = self.ln(x)
+
+        if self.task_type == "pretrain":
+            return self.head(x)
+        else:
+            if attention_mask is not None:
+                m = attention_mask.unsqueeze(-1).float()
+                x = (x * m).sum(dim=1) / m.sum(dim=1).clamp(min=1)
+            else:
+                x = x.mean(dim=1)
+            return self.head(x)
+
+
+# ---------------------------------------------------------------------------
 # RWKV-style architecture
 # ---------------------------------------------------------------------------
 
@@ -1712,8 +1876,13 @@ def build_model(model_type, vocab_size, d_model, n_heads, d_ff, n_layers,
             n_classes=n_classes, d_state=MAMBA_D_STATE, d_conv=MAMBA_D_CONV,
             expand=MAMBA_EXPAND,
         )
+    elif model_type == "hyena":
+        model = GenomicHyena(
+            vocab_size=vocab_size, d_model=d_model, n_layers=n_layers, d_ff=d_ff,
+            max_len=max_len, dropout=dropout, task_type=task_type, n_classes=n_classes,
+        )
     else:
-        raise ValueError(f"Unknown model type: {model_type}. Use: transformer, cnn, lstm, gru, conv_transformer, perceiver, rwkv, multiscale_cnn, mamba")
+        raise ValueError(f"Unknown model type: {model_type}. Use: transformer, cnn, lstm, gru, conv_transformer, perceiver, rwkv, multiscale_cnn, mamba, hyena")
 
     # Apply proper weight initialization
     model.apply(lambda m: _init_weights(m, d_model))
@@ -1830,6 +1999,22 @@ if __name__ == "__main__":
     ema = ModelEMA(model, decay=EMA_DECAY) if USE_EMA else None
     if ema:
         print(f"Model EMA: decay={EMA_DECAY}")
+
+    # Knowledge distillation: load teacher model
+    _teacher_model = None
+    if USE_DISTILLATION and TEACHER_CHECKPOINT and os.path.exists(TEACHER_CHECKPOINT):
+        try:
+            _teacher_ckpt = torch.load(TEACHER_CHECKPOINT, map_location=device, weights_only=False)
+            _tc = _teacher_ckpt["model_config"]
+            _teacher_model = build_model(**_tc).to(device)
+            _teacher_model.load_state_dict(_teacher_ckpt["model_state_dict"])
+            _teacher_model.eval()
+            for p in _teacher_model.parameters():
+                p.requires_grad = False
+            print(f"Distillation: teacher loaded from {TEACHER_CHECKPOINT} (alpha={DISTILL_ALPHA}, T={DISTILL_TEMP})")
+        except Exception as e:
+            print(f"Distillation: failed to load teacher ({e}), continuing without distillation")
+            _teacher_model = None
 
     num_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -2126,6 +2311,13 @@ if __name__ == "__main__":
                         num_workers=NUM_WORKERS, pin_memory=_pin,
                     )
 
+        # Progressive resizing: linearly grow effective max_length over training
+        _prog_resize_len = max_length
+        if USE_PROGRESSIVE_RESIZE:
+            elapsed_frac = (time.time() - t_start_training) / TIME_BUDGET
+            _prog_resize_len = int(PROGRESSIVE_START_LEN + (max_length - PROGRESSIVE_START_LEN) * min(elapsed_frac, 1.0))
+            _prog_resize_len = min(_prog_resize_len, max_length)
+
         for batch in train_loader:
             t0 = time.time()
 
@@ -2137,14 +2329,20 @@ if __name__ == "__main__":
                     curr_ratio = CURRICULUM_START_RATIO + (1.0 - CURRICULUM_START_RATIO) * min(elapsed_frac, 1.0)
                     _curriculum_len = max(16, int(max_length * curr_ratio))
 
+                # Progressive resizing: truncate to current effective length
+                _effective_len = min(
+                    _curriculum_len or max_length,
+                    _prog_resize_len if USE_PROGRESSIVE_RESIZE else max_length,
+                )
+
                 if task_type in ("classify", "regress"):
                     tokens_batch, mask_batch, labels_batch = batch
                     tokens_batch = tokens_batch.to(device)
                     mask_batch = mask_batch.to(device)
                     labels_batch = labels_batch.to(device)
-                    if _curriculum_len and _curriculum_len < tokens_batch.size(1):
-                        tokens_batch = tokens_batch[:, :_curriculum_len]
-                        mask_batch = mask_batch[:, :_curriculum_len]
+                    if _effective_len < tokens_batch.size(1):
+                        tokens_batch = tokens_batch[:, :_effective_len]
+                        mask_batch = mask_batch[:, :_effective_len]
 
                     # Data augmentation for classify/regress
                     if USE_SNP_NOISE and SNP_RATE > 0:
@@ -2188,9 +2386,9 @@ if __name__ == "__main__":
                     tokens_batch, mask_batch = batch
                     tokens_batch = tokens_batch.to(device)
                     mask_batch = mask_batch.to(device)
-                    if _curriculum_len and _curriculum_len < tokens_batch.size(1):
-                        tokens_batch = tokens_batch[:, :_curriculum_len]
-                        mask_batch = mask_batch[:, :_curriculum_len]
+                    if _effective_len < tokens_batch.size(1):
+                        tokens_batch = tokens_batch[:, :_effective_len]
+                        mask_batch = mask_batch[:, :_effective_len]
 
                     # Reverse complement augmentation (50% chance per batch)
                     if USE_RC_AUGMENT and torch.rand(1).item() < 0.5:
@@ -2288,6 +2486,21 @@ if __name__ == "__main__":
                             z2 = (emb2 * m1).sum(dim=1) / m1.sum(dim=1).clamp(min=1)
                             cl_loss = contrastive_loss(z1, z2, CONTRASTIVE_TEMP)
                             loss = loss + 0.1 * cl_loss
+
+                # Knowledge distillation: blend task loss with soft-target KL from teacher
+                if _teacher_model is not None and task_type == "pretrain":
+                    with torch.no_grad():
+                        if OBJECTIVE in ("mlm", "denoise"):
+                            _t_inp = input_ids if OBJECTIVE == "mlm" else corrupted
+                            teacher_logits = _teacher_model(_t_inp, attention_mask=mask_batch)
+                        else:
+                            teacher_logits = _teacher_model(input_ids, attention_mask=input_mask)
+                    kd_loss = distillation_loss(
+                        logits.reshape(-1, vocab_size),
+                        teacher_logits.reshape(-1, vocab_size),
+                        temperature=DISTILL_TEMP,
+                    )
+                    loss = (1 - DISTILL_ALPHA) * loss + DISTILL_ALPHA * kd_loss
 
                 # Scale loss for gradient accumulation
                 loss = loss / GRAD_ACCUM_STEPS
@@ -2526,6 +2739,34 @@ if __name__ == "__main__":
             # Extract the inner module weights from AveragedModel
             model.load_state_dict(swa_model.module.state_dict())
             results = swa_results
+
+    # Per-position accuracy (pretrain MLM/denoise only)
+    _per_pos_acc = None
+    if task_type == "pretrain" and OBJECTIVE in ("mlm", "denoise"):
+        try:
+            model.eval()
+            val_tokens = data["val_tokens"][:200].to(device)
+            val_mask = data["val_mask"][:200].to(device)
+            with torch.no_grad():
+                if OBJECTIVE == "mlm":
+                    _pp_input = val_tokens.clone()
+                    _pp_labels = val_tokens.clone()
+                    _mc = (val_mask == 1) & (val_tokens >= NUM_SPECIAL)
+                    _mr = torch.rand_like(val_tokens.float())
+                    _mp = _mc & (_mr < MASK_RATIO)
+                    _pp_input[_mp] = MASK_TOKEN_ID
+                    _pp_labels[~_mp] = PAD_TOKEN_ID
+                else:  # denoise
+                    _pp_input = denoise_corrupt(val_tokens, val_mask, NUM_SPECIAL)
+                    _pp_labels = val_tokens
+                _pp_logits = model(_pp_input, attention_mask=val_mask)
+                _per_pos_acc = per_position_accuracy(_pp_logits, _pp_labels, pad_id=PAD_TOKEN_ID)
+            if _per_pos_acc:
+                results["per_position_accuracy"] = _per_pos_acc
+                avg_pos = sum(_per_pos_acc.values()) / len(_per_pos_acc)
+                print(f"Per-position accuracy: {len(_per_pos_acc)} positions, avg={avg_pos:.4f}")
+        except Exception:
+            pass
 
     # ---------------------------------------------------------------------------
     # Summary
