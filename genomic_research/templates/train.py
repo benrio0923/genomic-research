@@ -177,6 +177,7 @@ HIERARCHICAL_N_CLASSES = _cfg("hierarchical_n_classes", [])      # n_classes per
 USE_VARIANT_EFFECT = _cfg("use_variant_effect", False)           # T128: variant effect prediction mode
 VARIANT_CONTEXT_WINDOW = _cfg("variant_context_window", 128)    # context bases around variant position
 USE_PROMOTER_PRED = _cfg("use_promoter_pred", False)             # T129: per-position promoter/enhancer prediction
+DOWNSTREAM_TASK = _cfg("downstream_task", "")                     # T133-T135: amr, host_prediction, geographic_origin (sets up classify)
 
 # ---------------------------------------------------------------------------
 # Data augmentation utilities

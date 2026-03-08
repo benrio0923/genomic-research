@@ -876,6 +876,115 @@ def phylogenetic_split(sequences, val_ratio=0.2, kmer_k=4, seed=42):
     return np.where(~val_mask)[0], np.where(val_mask)[0]
 
 
+def detect_recombination_breakpoints(sequences, window_size=200, step=50, kmer_k=4):
+    """Detect potential recombination breakpoints in sequences.
+
+    Uses a sliding-window approach comparing k-mer profiles of the left vs right
+    halves at each position. Sharp changes in similarity indicate breakpoints.
+
+    Args:
+        sequences: list of (id, sequence) tuples.
+        window_size: size of comparison windows.
+        step: step size for scanning.
+        kmer_k: k-mer size for profile comparison.
+
+    Returns: dict mapping sequence_id → list of (position, score) breakpoint candidates.
+    """
+    bases = "ATCG"
+    all_kmers = []
+    def _gen(prefix, depth):
+        if depth == 0:
+            all_kmers.append(prefix)
+            return
+        for b in bases:
+            _gen(prefix + b, depth - 1)
+    _gen("", kmer_k)
+    kmer_to_idx = {km: i for i, km in enumerate(all_kmers)}
+    dim = len(all_kmers)
+
+    def _kmer_profile(seq_fragment):
+        vec = np.zeros(dim, dtype=np.float32)
+        for i in range(len(seq_fragment) - kmer_k + 1):
+            km = seq_fragment[i:i+kmer_k]
+            ki = kmer_to_idx.get(km)
+            if ki is not None:
+                vec[ki] += 1
+        total = vec.sum()
+        if total > 0:
+            vec /= total
+        return vec
+
+    results = {}
+    for seq_id, seq in sequences:
+        if len(seq) < window_size * 2:
+            results[seq_id] = []
+            continue
+
+        scores = []
+        for pos in range(window_size, len(seq) - window_size, step):
+            left = _kmer_profile(seq[pos - window_size:pos])
+            right = _kmer_profile(seq[pos:pos + window_size])
+            # Jensen-Shannon divergence (simplified via L2 distance)
+            diff = np.sqrt(np.sum((left - right) ** 2))
+            scores.append((pos, float(diff)))
+
+        if not scores:
+            results[seq_id] = []
+            continue
+
+        # Find peaks (positions where divergence is significantly above mean)
+        score_vals = np.array([s[1] for s in scores])
+        mean_s = score_vals.mean()
+        std_s = score_vals.std() + 1e-9
+        breakpoints = [(pos, sc) for pos, sc in scores if sc > mean_s + 2 * std_s]
+        results[seq_id] = breakpoints
+
+    return results
+
+
+# ---------------------------------------------------------------------------
+# T133/T134/T135: Downstream task label loaders
+# ---------------------------------------------------------------------------
+
+def load_task_labels(label_path, task_name="classify"):
+    """Load labels for downstream tasks (AMR, host prediction, geographic origin, etc.).
+
+    Supports CSV with columns: id, label (or custom column names).
+    Returns dict mapping sequence_id → label string.
+
+    Args:
+        label_path: path to CSV file with labels.
+        task_name: descriptive name for error messages.
+
+    Returns: dict of {sequence_id: label_string}
+    """
+    import csv
+    labels = {}
+    with open(label_path, newline="") as f:
+        reader = csv.DictReader(f)
+        fieldnames = reader.fieldnames or []
+        # Auto-detect columns
+        id_col = None
+        label_col = None
+        for col in fieldnames:
+            cl = col.lower().strip()
+            if cl in ("id", "sequence_id", "seq_id", "accession", "name"):
+                id_col = col
+            elif cl in ("label", "class", "category", "target", task_name.lower(),
+                         "resistance", "host", "origin", "location", "species"):
+                label_col = col
+        if id_col is None and len(fieldnames) >= 2:
+            id_col = fieldnames[0]
+        if label_col is None and len(fieldnames) >= 2:
+            label_col = fieldnames[-1]
+        if id_col is None or label_col is None:
+            raise ValueError(f"Cannot detect id/label columns in {label_path} for task '{task_name}'. "
+                             f"Found columns: {fieldnames}")
+        for row in reader:
+            labels[row[id_col].strip()] = row[label_col].strip()
+    return labels
+
+
 def create_tokenizer(tokenizer_type="char", kmer_size=6, bpe_vocab_size=4096):
     """Factory function to create a tokenizer."""
     if tokenizer_type == "char":
