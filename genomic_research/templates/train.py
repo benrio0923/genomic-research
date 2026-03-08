@@ -69,6 +69,7 @@ if _config_path and os.path.exists(_config_path):
         print(f"Config loaded from {_config_path} (JSON)")
 
 _DRY_RUN = "--dry-run" in sys.argv
+_PROFILE = "--profile" in sys.argv
 
 def _cfg(key, default):
     """Get config value with override support."""
@@ -135,6 +136,7 @@ LR_LAYER_DECAY = _cfg("lr_layer_decay", 1.0)      # per-layer LR multiplier (1.0
 USE_SWA = _cfg("use_swa", False)   # stochastic weight averaging in final 25% of training
 SWA_LR = _cfg("swa_lr", 1e-5)     # SWA learning rate
 RESUME_FROM = _cfg("resume_from", "")  # path to checkpoint to resume training from
+USE_COMPILE = _cfg("use_compile", False)  # torch.compile() for faster training (PyTorch 2.0+, CUDA)
 
 # ---------------------------------------------------------------------------
 # Data augmentation utilities
@@ -996,6 +998,14 @@ if __name__ == "__main__":
     if OBJECTIVE == "clm":
         model._use_causal = True
 
+    # torch.compile() for faster training (PyTorch 2.0+)
+    if USE_COMPILE and hasattr(torch, "compile"):
+        try:
+            model = torch.compile(model)
+            print("torch.compile: enabled")
+        except Exception as e:
+            print(f"torch.compile failed ({e}), continuing without compilation")
+
     # Wrap with DDP
     if USE_DDP and _ddp_world_size > 1:
         model = DDP(model, device_ids=[_ddp_rank])
@@ -1213,6 +1223,25 @@ if __name__ == "__main__":
         swa_model = AveragedModel(model)
         print(f"SWA: enabled (lr={SWA_LR}, collects in final 25%)")
 
+    # PyTorch profiler (--profile flag)
+    _profiler = None
+    _profile_steps = 10
+    if _PROFILE:
+        try:
+            _profiler = torch.profiler.profile(
+                activities=[torch.profiler.ProfilerActivity.CPU]
+                + ([torch.profiler.ProfilerActivity.CUDA] if device.type == "cuda" else []),
+                schedule=torch.profiler.schedule(wait=1, warmup=2, active=_profile_steps - 3),
+                on_trace_ready=torch.profiler.tensorboard_trace_handler("reports"),
+                record_shapes=True,
+                with_stack=True,
+            )
+            _profiler.start()
+            print(f"Profiler: enabled for first {_profile_steps} steps → reports/")
+        except Exception as e:
+            print(f"Profiler setup failed ({e}), continuing without profiling")
+            _profiler = None
+
     model.train()
 
     while True:
@@ -1382,7 +1411,12 @@ if __name__ == "__main__":
                 history["steps"].append(step)
                 history["losses"].append(debiased_smooth_loss)
                 history["lrs"].append(lr)
-                print(f"\rstep {step:05d} ({pct_done:.1f}%) | loss: {debiased_smooth_loss:.6f} | lr: {lr:.2e} | epoch: {epoch} | remaining: {remaining:.0f}s    ", end="", flush=True)
+                # Progress bar
+                _bar_width = 20
+                _filled = int(_bar_width * min(pct_done / 100, 1.0))
+                _bar = "█" * _filled + "░" * (_bar_width - _filled)
+                _eta_m, _eta_s = divmod(int(remaining), 60)
+                print(f"\r{_bar} {pct_done:5.1f}% | step {step:05d} | loss {debiased_smooth_loss:.5f} | lr {lr:.1e} | ETA {_eta_m}m{_eta_s:02d}s    ", end="", flush=True)
 
             # Periodic evaluation
             if step > 5 and total_training_time - last_eval_time >= eval_interval_seconds:
@@ -1413,6 +1447,14 @@ if __name__ == "__main__":
                 last_eval_time = total_training_time
 
             step += 1
+
+            # Profiler step
+            if _profiler is not None:
+                _profiler.step()
+                if step >= _profile_steps:
+                    _profiler.stop()
+                    print(f"\nProfiler: trace saved to reports/")
+                    _profiler = None
 
             if (step > 5 and total_training_time >= TIME_BUDGET) or _interrupted:
                 break
