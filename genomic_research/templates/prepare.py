@@ -1524,6 +1524,49 @@ def _generate_classification_report(results, config, target_names, preds, target
         except (ImportError, Exception):
             pass
 
+    # Calibration Plot (T104)
+    if probs is not None and targets is not None and n_classes >= 2:
+        try:
+            from sklearn.calibration import calibration_curve
+            from sklearn.metrics import brier_score_loss
+
+            targets_arr = np.array(targets)
+            probs_arr = np.array(probs)
+
+            fig, ax = plt.subplots(figsize=(7, 7))
+            ax.plot([0, 1], [0, 1], "k--", lw=1, label="Perfectly calibrated")
+
+            if n_classes == 2:
+                prob_true, prob_pred = calibration_curve(targets_arr, probs_arr[:, 1], n_bins=10)
+                brier = brier_score_loss(targets_arr, probs_arr[:, 1])
+                ax.plot(prob_pred, prob_true, "o-", color="#2196F3",
+                        label=f"Model (Brier={brier:.3f})")
+            else:
+                # Multi-class: one-vs-rest calibration for each class
+                from sklearn.preprocessing import label_binarize
+                targets_bin = label_binarize(targets_arr, classes=list(range(n_classes)))
+                colors = plt.cm.tab10(np.linspace(0, 1, min(n_classes, 10)))
+                for i in range(min(n_classes, 10)):
+                    try:
+                        prob_true, prob_pred = calibration_curve(targets_bin[:, i], probs_arr[:, i], n_bins=10)
+                        lbl = labels[i] if i < len(labels) else str(i)
+                        ax.plot(prob_pred, prob_true, "o-", color=colors[i], label=lbl, markersize=4)
+                    except (ValueError, IndexError):
+                        continue
+
+            ax.set_xlabel("Mean Predicted Probability")
+            ax.set_ylabel("Fraction of Positives")
+            ax.set_title("Calibration Plot (Reliability Diagram)")
+            ax.legend(fontsize=7, loc="lower right")
+            ax.set_xlim(0, 1)
+            ax.set_ylim(0, 1)
+            ax.grid(True, alpha=0.3)
+            fig.tight_layout()
+            fig.savefig(os.path.join(report_dir, "calibration.png"), dpi=150)
+            plt.close(fig)
+        except (ImportError, Exception):
+            pass
+
     # Text report
     lines = ["Classification Report", "=" * 60]
     lines.append(f"{'Class':<20} {'Precision':>10} {'Recall':>10} {'F1':>10} {'Support':>10}")

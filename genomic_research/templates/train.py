@@ -106,6 +106,7 @@ RNN_TYPE = _cfg("rnn_type", "lstm")                # lstm or gru
 CNN_DILATION = _cfg("cnn_dilation", False)          # use exponential dilation in CNN
 STOCHASTIC_DEPTH = _cfg("stochastic_depth", 0.0)   # layer drop probability (0.0 = disabled)
 USE_DEEPNORM = _cfg("use_deepnorm", False)         # DeepNorm for stable deep training
+NORM_POSITION = _cfg("norm_position", "pre")       # "pre" (Pre-LN, default) or "post" (Post-LN)
 MAMBA_D_STATE = _cfg("mamba_d_state", 16)
 MAMBA_D_CONV = _cfg("mamba_d_conv", 4)
 MAMBA_EXPAND = _cfg("mamba_expand", 2)
@@ -142,6 +143,10 @@ RESUME_FROM = _cfg("resume_from", "")  # path to checkpoint to resume training f
 USE_COMPILE = _cfg("use_compile", False)  # torch.compile() for faster training (PyTorch 2.0+, CUDA)
 GRAD_NOISE = _cfg("grad_noise", 0.0)     # Gaussian noise std added to gradients (0 = disabled)
 USE_WHOLE_WORD_MASK = _cfg("use_whole_word_mask", False)  # mask whole k-mers for kmer tokenizer
+USE_MIXUP = _cfg("use_mixup", False)                     # mixup augmentation for classify/regress
+MIXUP_ALPHA = _cfg("mixup_alpha", 0.2)                   # Beta distribution alpha for mixup
+USE_CUTMIX = _cfg("use_cutmix", False)                   # CutMix augmentation for classify/regress
+CUTMIX_ALPHA = _cfg("cutmix_alpha", 1.0)                 # Beta distribution alpha for CutMix
 
 # ---------------------------------------------------------------------------
 # Data augmentation utilities
@@ -341,6 +346,46 @@ def whole_word_mask_tokens(tokens, mask, mask_ratio, mask_token_id, num_special,
     return input_ids, labels
 
 
+def mixup_data(x, y, alpha=0.2):
+    """Mixup: interpolate between two samples' embeddings and labels.
+
+    Returns mixed inputs, pair of labels (y_a, y_b), and lambda factor.
+    Applied after embedding, before model forward.
+    """
+    lam = np.random.beta(alpha, alpha) if alpha > 0 else 1.0
+    batch_size = x.size(0)
+    perm = torch.randperm(batch_size, device=x.device)
+    mixed_x = lam * x + (1 - lam) * x[perm]
+    return mixed_x, y, y[perm], lam
+
+
+def cutmix_tokens(tokens, mask, labels, alpha=1.0):
+    """CutMix: replace a random contiguous span with another sample's tokens.
+
+    Returns mixed tokens, mixed masks, pair of labels, and lambda factor.
+    """
+    lam = np.random.beta(alpha, alpha) if alpha > 0 else 1.0
+    batch_size = tokens.size(0)
+    seq_len = tokens.size(1)
+    perm = torch.randperm(batch_size, device=tokens.device)
+
+    # Determine cut region
+    cut_len = int(seq_len * (1 - lam))
+    if cut_len == 0:
+        return tokens, mask, labels, labels, 1.0
+    start = np.random.randint(0, max(1, seq_len - cut_len))
+    end = start + cut_len
+
+    mixed_tokens = tokens.clone()
+    mixed_mask = mask.clone()
+    mixed_tokens[:, start:end] = tokens[perm, start:end]
+    mixed_mask[:, start:end] = mask[perm, start:end]
+
+    # Adjust lambda to actual proportion
+    actual_lam = 1 - cut_len / seq_len
+    return mixed_tokens, mixed_mask, labels, labels[perm], actual_lam
+
+
 # ---------------------------------------------------------------------------
 # Model — Transformer Encoder (agent can replace entirely)
 # ---------------------------------------------------------------------------
@@ -484,12 +529,13 @@ class GenomicTransformerLayer(nn.Module):
     """Custom Transformer layer supporting RoPE/ALiBi."""
 
     def __init__(self, d_model, n_heads, d_ff, dropout, pos_type="sinusoidal",
-                 drop_path=0.0, deepnorm_alpha=1.0):
+                 drop_path=0.0, deepnorm_alpha=1.0, norm_position="pre"):
         super().__init__()
         self.pos_type = pos_type
         self.n_heads = n_heads
         self.head_dim = d_model // n_heads
         self.deepnorm_alpha = deepnorm_alpha  # DeepNorm residual scaling
+        self.norm_position = norm_position
 
         self.norm1 = nn.LayerNorm(d_model)
         self.norm2 = nn.LayerNorm(d_model)
@@ -512,8 +558,8 @@ class GenomicTransformerLayer(nn.Module):
 
     def forward(self, x, attn_bias=None, rotary_freqs=None, key_padding_mask=None, causal_mask=None):
         B, L, D = x.shape
-        # Pre-norm
-        h = self.norm1(x)
+        # Pre-norm or post-norm
+        h = self.norm1(x) if self.norm_position == "pre" else x
         q = self.q_proj(h).view(B, L, self.n_heads, self.head_dim).transpose(1, 2)
         k = self.k_proj(h).view(B, L, self.n_heads, self.head_dim).transpose(1, 2)
         v = self.v_proj(h).view(B, L, self.n_heads, self.head_dim).transpose(1, 2)
@@ -561,11 +607,16 @@ class GenomicTransformerLayer(nn.Module):
 
         out = out.transpose(1, 2).reshape(B, L, D)
         out = self.out_proj(out)
-        # DeepNorm: scale residual by alpha for stable deep training
+        # Residual connection (DeepNorm: scale residual by alpha)
         x = x * self.deepnorm_alpha + self.drop_path(self.ff_dropout(out))
+        if self.norm_position == "post":
+            x = self.norm1(x)
 
-        # Feed-forward with pre-norm
-        x = x * self.deepnorm_alpha + self.drop_path(self.ff(self.norm2(x)))
+        # Feed-forward
+        ff_in = self.norm2(x) if self.norm_position == "pre" else x
+        x = x * self.deepnorm_alpha + self.drop_path(self.ff(ff_in))
+        if self.norm_position == "post":
+            x = self.norm2(x)
         return x
 
 
@@ -574,7 +625,7 @@ class GenomicTransformer(nn.Module):
 
     def __init__(self, vocab_size, d_model, n_heads, d_ff, n_layers, max_len, dropout,
                  task_type, n_classes=None, pos_encoding="sinusoidal",
-                 stochastic_depth=0.0, use_deepnorm=False):
+                 stochastic_depth=0.0, use_deepnorm=False, norm_position="pre"):
         super().__init__()
         self.task_type = task_type
         self.d_model = d_model
@@ -611,13 +662,15 @@ class GenomicTransformer(nn.Module):
             self.layers = nn.ModuleList([
                 GenomicTransformerLayer(d_model, n_heads, d_ff, dropout, pos_encoding,
                                        drop_path=_dp_rates[i],
-                                       deepnorm_alpha=self._deepnorm_alpha)
+                                       deepnorm_alpha=self._deepnorm_alpha,
+                                       norm_position=norm_position)
                 for i in range(n_layers)
             ])
         else:
             encoder_layer = nn.TransformerEncoderLayer(
                 d_model=d_model, nhead=n_heads, dim_feedforward=d_ff,
-                dropout=dropout, activation="gelu", batch_first=True, norm_first=True,
+                dropout=dropout, activation="gelu", batch_first=True,
+                norm_first=(norm_position == "pre"),
             )
             self.encoder = nn.TransformerEncoder(
                 encoder_layer, num_layers=n_layers, enable_nested_tensor=False,
@@ -970,6 +1023,7 @@ def build_model(model_type, vocab_size, d_model, n_heads, d_ff, n_layers,
             task_type=task_type, n_classes=n_classes, pos_encoding=pe,
             stochastic_depth=STOCHASTIC_DEPTH,
             use_deepnorm=USE_DEEPNORM,
+            norm_position=NORM_POSITION,
         )
     elif model_type == "cnn":
         model = GenomicCNN(
@@ -1387,11 +1441,27 @@ if __name__ == "__main__":
                         tokens_batch, mask_batch = token_dropout_aug(
                             tokens_batch, mask_batch, TOKEN_DROPOUT, PAD_TOKEN_ID, NUM_SPECIAL)
 
+                    # CutMix: swap spans between samples (applied to tokens)
+                    _mixup_lam = None
+                    if USE_CUTMIX and CUTMIX_ALPHA > 0 and torch.rand(1).item() < 0.5:
+                        tokens_batch, mask_batch, labels_a, labels_b, _mixup_lam = cutmix_tokens(
+                            tokens_batch, mask_batch, labels_batch, CUTMIX_ALPHA)
+
                     with torch.amp.autocast(amp_device, enabled=amp_enabled, dtype=amp_dtype):
                         output = model(tokens_batch, attention_mask=mask_batch)
                         if task_type == "regress":
                             output = output.squeeze(-1)
-                        loss = criterion(output, labels_batch)
+
+                        # Mixup: interpolate output logits (applied after model forward)
+                        if USE_MIXUP and MIXUP_ALPHA > 0 and _mixup_lam is None and torch.rand(1).item() < 0.5:
+                            perm = torch.randperm(output.size(0), device=device)
+                            lam = np.random.beta(MIXUP_ALPHA, MIXUP_ALPHA)
+                            loss = lam * criterion(output, labels_batch) + (1 - lam) * criterion(output, labels_batch[perm])
+                        elif _mixup_lam is not None:
+                            # CutMix loss: weighted combination of two labels
+                            loss = _mixup_lam * criterion(output, labels_a) + (1 - _mixup_lam) * criterion(output, labels_b)
+                        else:
+                            loss = criterion(output, labels_batch)
 
                 else:  # pretrain
                     tokens_batch, mask_batch = batch
