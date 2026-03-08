@@ -36,5 +36,8 @@ training_history.json
 # Jupyter
 .ipynb_checkpoints/
 
+# Data (large sequence files)
+data/
+
 # Cache
 .cache/

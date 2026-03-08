@@ -537,7 +537,7 @@ def prepare_data(
         config["n_classes"] = n_classes
         config["target_names"] = target_names
         # Compute class weights for imbalanced data
-        train_label_counts = np.bincount(train_labels.numpy().astype(int), minlength=n_classes)
+        train_label_counts = np.bincount(train_labels.astype(int), minlength=n_classes)
         total = train_label_counts.sum()
         class_weights = (total / (n_classes * train_label_counts.clip(min=1))).tolist()
         config["class_weights"] = class_weights
