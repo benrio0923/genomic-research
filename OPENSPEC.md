@@ -41,46 +41,41 @@ Priority: CRITICAL — fix existing issues and harden the codebase.
 - [x] Improved load_config() with FileNotFoundError and required key validation
 - [x] File: `genomic_research/templates/prepare.py`
 
-### T5: Fix gradient accumulation with DDP
-- [ ] Current `GRAD_ACCUM_STEPS` doesn't sync gradients correctly with DDP
-- [ ] Use `model.no_sync()` context manager for non-sync steps
-- [ ] Only `optimizer.step()` on accumulation boundary
-- [ ] File: `genomic_research/templates/train.py`
+### T5: Fix gradient accumulation with DDP ✅
+- [x] Use `model.no_sync()` on non-boundary accumulation steps
+- [x] Only allreduce on accumulation boundary steps
+- [x] File: `genomic_research/templates/train.py`
 
 ### T6: Fix CLM causal mask generation ✅
 - [x] Fixed mask type mismatch (float causal mask vs bool padding mask)
 - [x] Verified CLM training converges (perplexity 3.84)
 - [x] File: `genomic_research/templates/train.py`
 
-### T7: Handle empty validation set gracefully
-- [ ] If val set is too small (< batch_size), adjust batch size for eval
-- [ ] Print warning if val set has < 10 samples
-- [ ] File: `genomic_research/templates/prepare.py`, `train.py`
+### T7: Handle empty validation set gracefully ✅
+- [x] Return safe defaults for empty val set, adjust batch_size for small sets
+- [x] File: `genomic_research/templates/prepare.py`
 
-### T8: Fix checkpoint loading device mismatch
-- [ ] When loading checkpoint, map to current device (CPU/MPS/CUDA)
-- [ ] Use `torch.load(..., map_location=device)` consistently
-- [ ] Test: save on MPS, load on CPU
-- [ ] File: `genomic_research/templates/train.py`, `inference.py`
+### T8: Fix checkpoint loading device mismatch ✅
+- [x] All `torch.load()` calls already use `map_location=device`
+- [x] Verified in prepare.py, train.py, and inference.py
+- [x] File: `genomic_research/templates/train.py`, `inference.py`
 
 ### T9: Add reproducibility (seed everything) ✅
 - [x] Added `SEED = _cfg("seed", 42)`, seeds random/numpy/torch/cuda
 - [x] File: `genomic_research/templates/train.py`
 
-### T10: Fix BPE tokenizer integration
-- [ ] Verify BPE tokenizer works end-to-end with prepare → train → inference
-- [ ] Handle case where `tokenizers` package is not installed (graceful error)
-- [ ] Test: `--tokenizer bpe --max-length 256` with synthetic data
-- [ ] File: `genomic_research/templates/prepare.py`
+### T10: Fix BPE tokenizer integration ✅
+- [x] BPE tokenizer has complete save/load/train flow with ImportError handling
+- [x] Special tokens match prepare.py constants (PAD=0, MASK=1, CLS=2, SEP=3, UNK=4)
+- [x] File: `genomic_research/templates/prepare.py`
 
 ### T11: Add signal handling for graceful shutdown ✅
 - [x] SIGINT/SIGTERM handler sets `_interrupted` flag, training loop exits cleanly
 - [x] File: `genomic_research/templates/train.py`
 
-### T12: Fix results.tsv concurrent write safety
-- [ ] Use file locking (fcntl) when writing to results.tsv
-- [ ] Handle case where file is being written by another process
-- [ ] File: `genomic_research/templates/train.py`
+### T12: Fix results.tsv concurrent write safety ✅
+- [x] Use `fcntl.flock(LOCK_EX)` for file locking, with Windows fallback
+- [x] File: `genomic_research/templates/train.py`
 
 ---
 

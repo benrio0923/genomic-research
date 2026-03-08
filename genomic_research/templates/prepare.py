@@ -685,6 +685,13 @@ def evaluate(model, data, task_type, config, objective="mlm", batch_size=64, dev
     val_mask = data["val_mask"]
     vocab_size = config["vocab_size"]
 
+    # Handle empty or very small validation set
+    if len(val_tokens) == 0:
+        print("  Warning: empty validation set, skipping evaluation")
+        return {"val_score": 0.0, "val_loss": float("inf")}
+    if len(val_tokens) < batch_size:
+        batch_size = max(1, len(val_tokens))
+
     if task_type == "pretrain":
         return _evaluate_pretrain(model, val_tokens, val_mask, vocab_size, objective, batch_size, device, mask_ratio)
     elif task_type == "classify":

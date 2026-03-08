@@ -1022,14 +1022,27 @@ if __name__ == "__main__":
                 # Scale loss for gradient accumulation
                 loss = loss / GRAD_ACCUM_STEPS
 
-                # Backward with AMP
-                if scaler is not None:
-                    scaler.scale(loss).backward()
+                # DDP: skip gradient sync on non-boundary accumulation steps
+                _is_accum_boundary = (step + 1) % GRAD_ACCUM_STEPS == 0 or step < 5
+                _should_no_sync = (USE_DDP and _ddp_world_size > 1
+                                   and not _is_accum_boundary
+                                   and hasattr(model, 'no_sync'))
+
+                # Backward with AMP (skip DDP allreduce on non-boundary steps)
+                if _should_no_sync:
+                    with model.no_sync():
+                        if scaler is not None:
+                            scaler.scale(loss).backward()
+                        else:
+                            loss.backward()
                 else:
-                    loss.backward()
+                    if scaler is not None:
+                        scaler.scale(loss).backward()
+                    else:
+                        loss.backward()
 
                 # Optimizer step every GRAD_ACCUM_STEPS
-                if (step + 1) % GRAD_ACCUM_STEPS == 0 or step < 5:
+                if _is_accum_boundary:
                     if scaler is not None:
                         scaler.unscale_(optimizer)
                         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -1368,11 +1381,24 @@ if __name__ == "__main__":
         row["val_r2"] = f"{results['val_r2']:.4f}"
 
     fieldnames = list(row.keys())
-    with open(results_file, "a", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames, delimiter="\t")
-        if not file_exists:
-            writer.writeheader()
-        writer.writerow(row)
+    try:
+        import fcntl
+        with open(results_file, "a", newline="") as f:
+            fcntl.flock(f, fcntl.LOCK_EX)
+            try:
+                writer = csv.DictWriter(f, fieldnames=fieldnames, delimiter="\t")
+                if not file_exists:
+                    writer.writeheader()
+                writer.writerow(row)
+            finally:
+                fcntl.flock(f, fcntl.LOCK_UN)
+    except ImportError:
+        # Windows: fcntl not available — fall back to unlocked write
+        with open(results_file, "a", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames, delimiter="\t")
+            if not file_exists:
+                writer.writeheader()
+            writer.writerow(row)
 
     print(f"Results logged to {results_file}")
 
