@@ -654,17 +654,95 @@ def cmd_export(args):
             print(f"ONNX export failed: {e}", file=sys.stderr)
             print("Hint: pip install onnx onnxruntime")
             sys.exit(1)
+
+    elif fmt == "quantized":
+        # T136: INT8 post-training quantization
+        output_path = args.output or "model_int8.pt"
+        try:
+            model.cpu()
+            quantized = torch.quantization.quantize_dynamic(
+                model, {torch.nn.Linear}, dtype=torch.qint8
+            )
+            torch.save({
+                "model_state_dict": quantized.state_dict(),
+                "model_config": model_config,
+                "quantized": True,
+            }, output_path)
+            print(f"INT8 quantized model saved to {output_path}")
+            # Compare sizes
+            orig_size = os.path.getsize(ckpt_path) / (1024 * 1024)
+            new_size = os.path.getsize(output_path) / (1024 * 1024)
+            print(f"  Size reduction: {orig_size:.1f} MB → {new_size:.1f} MB ({(1-new_size/orig_size)*100:.0f}% smaller)")
+        except Exception as e:
+            print(f"Quantization failed: {e}", file=sys.stderr)
+            sys.exit(1)
+
+    elif fmt == "pruned":
+        # T146: Magnitude-based unstructured pruning
+        output_path = args.output or "model_pruned.pt"
+        amount = args.prune_amount
+        try:
+            import torch.nn.utils.prune as prune
+            pruned_count = 0
+            for name, module in model.named_modules():
+                if isinstance(module, torch.nn.Linear):
+                    prune.l1_unstructured(module, name="weight", amount=amount)
+                    prune.remove(module, "weight")
+                    pruned_count += 1
+            # Count zeros
+            total_w = 0
+            zero_w = 0
+            for p in model.parameters():
+                total_w += p.numel()
+                zero_w += (p == 0).sum().item()
+            sparsity = zero_w / total_w if total_w > 0 else 0
+            torch.save({
+                "model_state_dict": model.state_dict(),
+                "model_config": model_config,
+                "pruned": True,
+                "prune_amount": amount,
+                "sparsity": sparsity,
+            }, output_path)
+            print(f"Pruned model saved to {output_path}")
+            print(f"  Pruned {pruned_count} Linear layers at {amount:.0%} sparsity")
+            print(f"  Actual sparsity: {sparsity:.1%} of all weights are zero")
+        except Exception as e:
+            print(f"Pruning failed: {e}", file=sys.stderr)
+            sys.exit(1)
+
+    elif fmt == "safetensors":
+        # T147: SafeTensors export
+        output_path = args.output or "model.safetensors"
+        try:
+            from safetensors.torch import save_file
+        except ImportError:
+            print("Error: safetensors not installed. Run: pip install safetensors", file=sys.stderr)
+            sys.exit(1)
+        try:
+            save_file(model.state_dict(), output_path)
+            print(f"SafeTensors model saved to {output_path}")
+            # Also save config alongside
+            import json
+            config_path = output_path.replace(".safetensors", "_config.json")
+            with open(config_path, "w") as f:
+                json.dump(model_config, f, indent=2)
+            print(f"  Config saved to {config_path}")
+        except Exception as e:
+            print(f"SafeTensors export failed: {e}", file=sys.stderr)
+            sys.exit(1)
+
     else:
         print(f"Unsupported format: {fmt}", file=sys.stderr)
         sys.exit(1)
 
     # Print export info
-    file_size = os.path.getsize(output_path) / (1024 * 1024)
-    total_params = sum(p.numel() for p in model.parameters())
-    print(f"  Format:     {fmt}")
-    print(f"  File size:  {file_size:.1f} MB")
-    print(f"  Parameters: {total_params:,}")
-    print(f"  Input:      tokens[batch, {seq_len}] + mask[batch, {seq_len}]")
+    if os.path.exists(output_path):
+        file_size = os.path.getsize(output_path) / (1024 * 1024)
+        total_params = sum(p.numel() for p in model.parameters())
+        print(f"  Format:     {fmt}")
+        print(f"  File size:  {file_size:.1f} MB")
+        print(f"  Parameters: {total_params:,}")
+        print(f"  Input:      tokens[batch, {seq_len}] + mask[batch, {seq_len}]")
 
 
 def cmd_search(args):
@@ -1421,12 +1499,13 @@ def main():
     p_embed.add_argument("--output", type=str, default="embeddings.npy", help="Output file (.npy)")
 
     # export
-    p_export = subparsers.add_parser("export", help="Export model to TorchScript or ONNX")
+    p_export = subparsers.add_parser("export", help="Export model (TorchScript/ONNX/quantized/pruned/SafeTensors)")
     p_export.add_argument("--checkpoint", type=str, required=True, help="Path to model checkpoint (.pt)")
     p_export.add_argument("--format", type=str, default="torchscript",
-                          choices=["torchscript", "onnx"],
+                          choices=["torchscript", "onnx", "quantized", "pruned", "safetensors"],
                           help="Export format (default: torchscript)")
     p_export.add_argument("--output", type=str, default=None, help="Output file path")
+    p_export.add_argument("--prune-amount", type=float, default=0.3, help="Pruning sparsity (0-1, default: 0.3)")
 
     # compare
     p_compare = subparsers.add_parser("compare", help="Compare two experiment results")
