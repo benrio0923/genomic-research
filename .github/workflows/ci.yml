@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+          pip install pytest
+
+      - name: Run smoke tests
+        run: |
+          pytest tests/test_smoke.py -v --tb=short -x
+        env:
+          GENOMIC_TIME_BUDGET: "10"
+
+      - name: End-to-end synthetic test
+        run: |
+          cd /tmp
+          python -c "
+          import random
+          random.seed(42)
+          bases = 'ATCG'
+          with open('test.fasta', 'w') as f:
+              for i in range(30):
+                  length = random.randint(100, 300)
+                  seq = ''.join(random.choice(bases) for _ in range(length))
+                  f.write(f'>seq_{i}\n{seq}\n')
+          "
+          genomic-research init --fasta test.fasta --task pretrain --tokenizer char --max-length 64
+          GENOMIC_TIME_BUDGET=10 python train.py
+          test -f reports/metrics.json

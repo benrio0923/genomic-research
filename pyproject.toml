@@ -1,0 +1,50 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "genomic-research"
+version = "0.1.0"
+description = "A universal genomic sequence AI research framework for training foundation models"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+authors = [{ name = "benrio0923" }]
+keywords = ["genomics", "foundation-model", "transformer", "mamba", "pytorch", "ai-agents"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+dependencies = [
+    "numpy>=1.24.0",
+    "torch>=2.0.0",
+    "biopython>=1.80",
+    "scikit-learn>=1.3.0",
+    "matplotlib>=3.7.0",
+]
+
+[project.optional-dependencies]
+mamba = ["mamba-ssm>=2.0.0", "causal-conv1d>=1.4.0"]
+bpe = ["tokenizers>=0.15.0"]
+all = ["mamba-ssm>=2.0.0", "causal-conv1d>=1.4.0", "tokenizers>=0.15.0"]
+
+[project.scripts]
+genomic-research = "genomic_research.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/benrio0923/genomic-research"
+Repository = "https://github.com/benrio0923/genomic-research"
+Issues = "https://github.com/benrio0923/genomic-research/issues"
+
+[tool.setuptools.packages.find]
+include = ["genomic_research*"]
+
+[tool.setuptools.package-data]
+genomic_research = ["templates/*"]
