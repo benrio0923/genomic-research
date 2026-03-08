@@ -1428,6 +1428,94 @@ def cmd_compare(args):
         print(f"{key:<30} {v1:>12.4f} {v2:>12.4f} {sign}{delta:>11.4f} {sign}{pct:>6.1f}%")
 
 
+def cmd_leaderboard(args):
+    """Show experiment leaderboard from results.tsv, ranked by val_score (T153)."""
+    import csv
+
+    results_file = args.file or "results.tsv"
+    if not os.path.exists(results_file):
+        print(f"Error: {results_file} not found. Run experiments first.", file=sys.stderr)
+        sys.exit(1)
+
+    with open(results_file, newline="") as f:
+        reader = csv.DictReader(f, delimiter="\t")
+        rows = list(reader)
+
+    if not rows:
+        print("No experiments found.")
+        return
+
+    # Sort by val_score descending
+    for r in rows:
+        try:
+            r["_score"] = float(r.get("val_score", 0))
+        except ValueError:
+            r["_score"] = 0
+    rows.sort(key=lambda r: r["_score"], reverse=True)
+
+    # Display
+    print(f"\n{'Rank':>4}  {'Model':<18} {'Objective':<6} {'d_model':>7} {'Layers':>6} {'val_score':>10} {'Params':>10} {'Time':>8}  {'Timestamp'}")
+    print("-" * 100)
+    for i, r in enumerate(rows, 1):
+        model = r.get("model_type", "?")[:18]
+        obj = r.get("objective", "?")[:6]
+        dm = r.get("d_model", "?")
+        nl = r.get("n_layers", "?")
+        vs = r.get("val_score", "?")
+        np_ = r.get("num_params", "?")
+        ts = r.get("training_seconds", "?")
+        time_str = r.get("timestamp", "")
+        marker = " ★" if i == 1 else ""
+        print(f"{i:>4}  {model:<18} {obj:<6} {dm:>7} {nl:>6} {vs:>10} {np_:>10} {ts:>8}  {time_str}{marker}")
+
+    print(f"\nTotal: {len(rows)} experiments")
+    if args.top:
+        top_n = min(args.top, len(rows))
+        print(f"\nShowing top {top_n} experiments")
+
+
+def cmd_archive(args):
+    """Archive experiment results as tar.gz (T160)."""
+    import tarfile
+    from datetime import datetime
+
+    name = args.name or f"experiment_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    archive_path = f"{name}.tar.gz"
+
+    files_to_archive = []
+    candidates = [
+        "train.py", "prepare.py", "results.tsv",
+        "reports/metrics.json", "reports/training_curve.png",
+        "reports/val_score_curve.png", "reports/confusion_matrix.png",
+        "checkpoints/best_model.pt", "checkpoints/run_config.json",
+        "MODEL_CARD.md",
+    ]
+    # Also include all reports
+    if os.path.isdir("reports"):
+        for f in os.listdir("reports"):
+            fp = os.path.join("reports", f)
+            if fp not in candidates:
+                candidates.append(fp)
+
+    for f in candidates:
+        if os.path.exists(f):
+            files_to_archive.append(f)
+
+    if not files_to_archive:
+        print("No experiment files found to archive.", file=sys.stderr)
+        sys.exit(1)
+
+    with tarfile.open(archive_path, "w:gz") as tar:
+        for f in files_to_archive:
+            tar.add(f, arcname=os.path.join(name, f))
+
+    size_mb = os.path.getsize(archive_path) / (1024 * 1024)
+    print(f"Archive saved to {archive_path} ({size_mb:.1f} MB)")
+    print(f"  Contains {len(files_to_archive)} files:")
+    for f in files_to_archive:
+        print(f"    {f}")
+
+
 def main():
     parser = argparse.ArgumentParser(
         prog="genomic-research",
@@ -1570,6 +1658,15 @@ def main():
     p_card.add_argument("--checkpoint", type=str, default="checkpoints/best_model.pt")
     p_card.add_argument("--output", type=str, default=None, help="Output path (default: MODEL_CARD.md)")
 
+    # leaderboard
+    p_lb = subparsers.add_parser("leaderboard", help="Show experiment leaderboard ranked by val_score")
+    p_lb.add_argument("--file", type=str, default=None, help="Path to results.tsv")
+    p_lb.add_argument("--top", type=int, default=None, help="Show only top N experiments")
+
+    # archive
+    p_archive = subparsers.add_parser("archive", help="Archive experiment as tar.gz")
+    p_archive.add_argument("--name", type=str, default=None, help="Archive name (default: auto-generated)")
+
     args = parser.parse_args()
 
     if args.command == "init":
@@ -1610,6 +1707,10 @@ def main():
         cmd_msa_embed(args)
     elif args.command == "model-card":
         cmd_model_card(args)
+    elif args.command == "leaderboard":
+        cmd_leaderboard(args)
+    elif args.command == "archive":
+        cmd_archive(args)
     else:
         parser.print_help()
 

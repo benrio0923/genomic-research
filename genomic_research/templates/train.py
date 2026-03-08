@@ -183,6 +183,7 @@ DOWNSTREAM_TASK = _cfg("downstream_task", "")                     # T133-T135: a
 USE_WANDB = _cfg("use_wandb", False)                              # T149: Weights & Biases logging
 WANDB_PROJECT = _cfg("wandb_project", "genomic-research")         # W&B project name
 USE_TENSORBOARD = _cfg("use_tensorboard", False)                  # T150: TensorBoard logging
+USE_MLFLOW = _cfg("use_mlflow", False)                            # T151: MLflow logging
 EXPERIMENT_TAG = _cfg("experiment_tag", "")                       # T156: descriptive experiment tag
 
 # ---------------------------------------------------------------------------
@@ -2757,6 +2758,48 @@ if __name__ == "__main__":
             print(f"TensorBoard: init failed ({e}), skipping")
 
     # ---------------------------------------------------------------------------
+    # T151: MLflow integration (optional)
+    # ---------------------------------------------------------------------------
+    _mlflow_run = None
+    if USE_MLFLOW:
+        try:
+            import mlflow
+            mlflow.set_experiment(WANDB_PROJECT)  # reuse project name
+            _mlflow_run = mlflow.start_run()
+            mlflow.log_params({k: str(v)[:250] for k, v in _run_config.items()})
+            print(f"MLflow: logging to experiment '{WANDB_PROJECT}'")
+        except ImportError:
+            print("MLflow: mlflow not installed (pip install mlflow), skipping")
+        except Exception as e:
+            print(f"MLflow: init failed ({e}), skipping")
+
+    # ---------------------------------------------------------------------------
+    # T154: Reproducibility checker — record library versions + data hash
+    # ---------------------------------------------------------------------------
+    _repro_info = {
+        "python_version": sys.version,
+        "torch_version": torch.__version__,
+        "numpy_version": np.__version__,
+        "cuda_available": torch.cuda.is_available(),
+        "cuda_version": torch.version.cuda if torch.cuda.is_available() else None,
+        "seed": SEED,
+    }
+    # Hash the training data for reproducibility
+    try:
+        import hashlib
+        _data_hash = hashlib.md5()
+        for _key in sorted(data.keys()):
+            if hasattr(data[_key], "numpy"):
+                _data_hash.update(data[_key].numpy().tobytes()[:4096])
+        _repro_info["data_hash"] = _data_hash.hexdigest()
+    except Exception:
+        _repro_info["data_hash"] = "unknown"
+    _run_config["reproducibility"] = _repro_info
+    # Update config snapshot with reproducibility info
+    with open("checkpoints/run_config.json", "w") as _f:
+        _json.dump(_run_config, _f, indent=2)
+
+    # ---------------------------------------------------------------------------
     # Training loop
     # ---------------------------------------------------------------------------
 
@@ -3195,6 +3238,14 @@ if __name__ == "__main__":
                     _tb_writer.add_scalar("train/loss", debiased_smooth_loss, step)
                     _tb_writer.add_scalar("train/lr", lr, step)
 
+                # T151: MLflow step logging
+                if _mlflow_run is not None:
+                    try:
+                        import mlflow
+                        mlflow.log_metrics({"train_loss": debiased_smooth_loss, "lr": lr}, step=step)
+                    except Exception:
+                        pass
+
             # Periodic evaluation
             if step > 5 and total_training_time - last_eval_time >= eval_interval_seconds:
                 model.eval()
@@ -3227,6 +3278,15 @@ if __name__ == "__main__":
                     for ek, ev in eval_results.items():
                         if isinstance(ev, (int, float)) and ek != "val_score":
                             _tb_writer.add_scalar(f"eval/{ek}", ev, step)
+
+                # T151: MLflow eval logging
+                if _mlflow_run is not None:
+                    try:
+                        import mlflow
+                        _ml_metrics = {f"eval_{ek}": ev for ek, ev in eval_results.items() if isinstance(ev, (int, float))}
+                        mlflow.log_metrics(_ml_metrics, step=step)
+                    except Exception:
+                        pass
 
                 if best_val_score is None or eval_results["val_score"] > best_val_score:
                     best_val_score = eval_results["val_score"]
@@ -3636,6 +3696,17 @@ if __name__ == "__main__":
     if _tb_writer is not None:
         _tb_writer.close()
         print("TensorBoard: writer closed")
+    if _mlflow_run is not None:
+        try:
+            import mlflow
+            mlflow.log_metrics({"final_val_score": results["val_score"]})
+            mlflow.log_artifact("checkpoints/run_config.json")
+            if os.path.exists("reports/metrics.json"):
+                mlflow.log_artifact("reports/metrics.json")
+            mlflow.end_run()
+            print("MLflow: run finished")
+        except Exception:
+            pass
 
     # ---------------------------------------------------------------------------
     # Optional: ONNX export
