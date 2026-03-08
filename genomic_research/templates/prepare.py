@@ -653,6 +653,152 @@ class BPETokenizer:
         return obj
 
 
+class CodonTokenizer:
+    """Codon-aware tokenizer: tokenizes in reading frames (3 bases per token).
+
+    64 codons + special tokens. Handles coding regions more naturally.
+    """
+
+    def __init__(self):
+        self.codon_to_id = {}
+        self.id_to_codon = {}
+        bases = "ATCG"
+        codons = [a + b + c for a in bases for b in bases for c in bases]
+        for i, codon in enumerate(sorted(codons)):
+            self.codon_to_id[codon] = NUM_SPECIAL + i
+            self.id_to_codon[NUM_SPECIAL + i] = codon
+        # Codons with N
+        self.vocab_size = NUM_SPECIAL + len(self.codon_to_id) + 1  # +1 for unknown codon
+        self._unk_codon_id = NUM_SPECIAL + len(self.codon_to_id)
+
+    def encode(self, sequence):
+        tokens = []
+        for i in range(0, len(sequence) - 2, 3):
+            codon = sequence[i:i+3]
+            tokens.append(self.codon_to_id.get(codon, self._unk_codon_id))
+        return tokens
+
+    def decode(self, ids):
+        return "".join(self.id_to_codon.get(i, "NNN") for i in ids if i >= NUM_SPECIAL)
+
+    def save(self, path):
+        with open(path, "w") as f:
+            json.dump({"type": "codon", "vocab_size": self.vocab_size}, f)
+
+    @classmethod
+    def load(cls, path):
+        return cls()
+
+
+def detect_orfs(sequence, min_length=100):
+    """Find open reading frames in a DNA sequence.
+
+    Args:
+        sequence: DNA sequence string (ATCG).
+        min_length: Minimum ORF length in nucleotides.
+
+    Returns: list of (start, end, frame, strand) tuples.
+    """
+    start_codon = "ATG"
+    stop_codons = {"TAA", "TAG", "TGA"}
+    orfs = []
+
+    # Search all 3 reading frames on forward strand
+    for frame in range(3):
+        i = frame
+        orf_start = None
+        while i <= len(sequence) - 3:
+            codon = sequence[i:i+3]
+            if codon == start_codon and orf_start is None:
+                orf_start = i
+            elif codon in stop_codons and orf_start is not None:
+                orf_len = i + 3 - orf_start
+                if orf_len >= min_length:
+                    orfs.append((orf_start, i + 3, frame, "+"))
+                orf_start = None
+            i += 3
+
+    # Reverse complement for reverse strand
+    complement = {"A": "T", "T": "A", "C": "G", "G": "C", "N": "N"}
+    rc_seq = "".join(complement.get(c, "N") for c in reversed(sequence))
+    for frame in range(3):
+        i = frame
+        orf_start = None
+        while i <= len(rc_seq) - 3:
+            codon = rc_seq[i:i+3]
+            if codon == start_codon and orf_start is None:
+                orf_start = i
+            elif codon in stop_codons and orf_start is not None:
+                orf_len = i + 3 - orf_start
+                if orf_len >= min_length:
+                    # Map back to forward strand coordinates
+                    fwd_end = len(sequence) - orf_start
+                    fwd_start = len(sequence) - (i + 3)
+                    orfs.append((fwd_start, fwd_end, frame, "-"))
+                orf_start = None
+            i += 3
+
+    return sorted(orfs, key=lambda x: x[0])
+
+
+def orf_to_position_labels(orfs, seq_length):
+    """Convert ORF positions to per-position binary labels (coding=1, non-coding=0)."""
+    labels = np.zeros(seq_length, dtype=np.int64)
+    for start, end, _, _ in orfs:
+        s = max(0, start)
+        e = min(end, seq_length)
+        labels[s:e] = 1
+    return labels
+
+
+def compute_kmer_spectrum(sequences, k_values=(2, 3, 4)):
+    """Compute k-mer frequency spectrum features for each sequence.
+
+    Args:
+        sequences: list of (id, sequence) tuples.
+        k_values: tuple of k values to compute.
+
+    Returns: numpy array of shape (n_sequences, total_features).
+    """
+    all_features = []
+    for _, seq in sequences:
+        features = []
+        for k in k_values:
+            bases = "ATCG"
+            all_kmers = []
+            def _gen(prefix, depth):
+                if depth == 0:
+                    all_kmers.append(prefix)
+                    return
+                for b in bases:
+                    _gen(prefix + b, depth - 1)
+            _gen("", k)
+
+            counts = {}
+            for i in range(len(seq) - k + 1):
+                kmer = seq[i:i+k]
+                if all(c in "ATCG" for c in kmer):
+                    counts[kmer] = counts.get(kmer, 0) + 1
+            total = sum(counts.values()) or 1
+            features.extend([counts.get(km, 0) / total for km in all_kmers])
+        all_features.append(features)
+
+    return np.array(all_features, dtype=np.float32)
+
+
+def compute_gc_content_features(sequence, window_size=50, stride=10):
+    """Compute sliding window GC content features for a sequence.
+
+    Returns: numpy array of shape (n_windows,) with GC fraction per window.
+    """
+    gc_features = []
+    for start in range(0, max(1, len(sequence) - window_size + 1), stride):
+        window = sequence[start:start + window_size]
+        gc = sum(1 for c in window if c in "GC") / max(len(window), 1)
+        gc_features.append(gc)
+    return np.array(gc_features, dtype=np.float32)
+
+
 def create_tokenizer(tokenizer_type="char", kmer_size=6, bpe_vocab_size=4096):
     """Factory function to create a tokenizer."""
     if tokenizer_type == "char":
@@ -661,8 +807,10 @@ def create_tokenizer(tokenizer_type="char", kmer_size=6, bpe_vocab_size=4096):
         return KmerTokenizer(k=kmer_size)
     elif tokenizer_type == "bpe":
         return BPETokenizer(vocab_size=bpe_vocab_size)
+    elif tokenizer_type == "codon":
+        return CodonTokenizer()
     else:
-        raise ValueError(f"Unknown tokenizer type: {tokenizer_type}. Use char, kmer, or bpe.")
+        raise ValueError(f"Unknown tokenizer type: {tokenizer_type}. Use char, kmer, bpe, or codon.")
 
 
 def load_tokenizer(path):
@@ -676,6 +824,10 @@ def load_tokenizer(path):
         return KmerTokenizer.load(path)
     elif t == "bpe":
         return BPETokenizer.load(path)
+    elif t == "codon":
+        return CodonTokenizer.load(path)
+    elif t == "protein":
+        return ProteinTokenizer.load(path)
     else:
         raise ValueError(f"Unknown tokenizer type: {t}")
 
