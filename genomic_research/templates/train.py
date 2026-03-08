@@ -72,12 +72,15 @@ D_FF = _cfg("d_ff", 1024)                          # feed-forward dimension
 DROPOUT = _cfg("dropout", 0.1)                     # dropout rate
 LEARNING_RATE = _cfg("learning_rate", 1e-4)        # learning rate
 WEIGHT_DECAY = _cfg("weight_decay", 1e-4)          # L2 regularization
+OPTIMIZER = _cfg("optimizer", "adamw")             # adamw, sgd, lamb
 BATCH_SIZE = _cfg("batch_size", 32)                # training batch size
 LR_SCHEDULE = _cfg("lr_schedule", "cosine")        # lr schedule: constant, cosine, step
 WARMUP_RATIO = _cfg("warmup_ratio", 0.05)          # fraction of training for LR warmup
 OBJECTIVE = _cfg("objective", "mlm")               # mlm or clm
 MASK_RATIO = _cfg("mask_ratio", 0.15)              # fraction of tokens to mask (MLM only)
 LABEL_SMOOTHING = _cfg("label_smoothing", 0.0)     # label smoothing for CE loss (0.0 = off)
+LOSS_FN = _cfg("loss_fn", "cross_entropy")         # cross_entropy or focal
+FOCAL_GAMMA = _cfg("focal_gamma", 2.0)             # focal loss gamma (only if loss_fn=focal)
 
 # --- Architecture-specific ---
 POS_ENCODING = _cfg("pos_encoding", "sinusoidal")  # sinusoidal, rotary, alibi, learned
@@ -107,8 +110,10 @@ SEED = _cfg("seed", 42)       # random seed for reproducibility
 USE_EMA = _cfg("use_ema", False)   # exponential moving average of model weights
 EMA_DECAY = _cfg("ema_decay", 0.999)  # EMA decay factor
 EARLY_STOP_PATIENCE = _cfg("early_stop_patience", 0)  # 0 = disabled; stop after N evals without improvement
+LR_LAYER_DECAY = _cfg("lr_layer_decay", 1.0)      # per-layer LR multiplier (1.0 = same LR for all layers)
 USE_SWA = _cfg("use_swa", False)   # stochastic weight averaging in final 25% of training
 SWA_LR = _cfg("swa_lr", 1e-5)     # SWA learning rate
+RESUME_FROM = _cfg("resume_from", "")  # path to checkpoint to resume training from
 
 # ---------------------------------------------------------------------------
 # Data augmentation utilities
@@ -240,6 +245,60 @@ class ALiBiPositionBias(nn.Module):
         relative = positions.unsqueeze(0) - positions.unsqueeze(1)  # (L, L)
         bias = self.slopes.unsqueeze(-1).unsqueeze(-1) * relative.abs().unsqueeze(0).float()
         return -bias  # negative because closer = higher attention
+
+
+class FocalLoss(nn.Module):
+    """Focal loss for handling class imbalance (Lin et al., 2017)."""
+
+    def __init__(self, gamma=2.0, weight=None, label_smoothing=0.0):
+        super().__init__()
+        self.gamma = gamma
+        self.weight = weight
+        self.label_smoothing = label_smoothing
+
+    def forward(self, inputs, targets):
+        ce = nn.functional.cross_entropy(
+            inputs, targets, weight=self.weight,
+            label_smoothing=self.label_smoothing, reduction="none",
+        )
+        pt = torch.exp(-ce)
+        focal = ((1 - pt) ** self.gamma) * ce
+        return focal.mean()
+
+
+class LAMB(torch.optim.Optimizer):
+    """LAMB optimizer for large-batch training (You et al., 2019)."""
+
+    def __init__(self, params, lr=1e-3, betas=(0.9, 0.999), eps=1e-6, weight_decay=0.0):
+        defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
+        super().__init__(params, defaults)
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        for group in self.param_groups:
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                grad = p.grad
+                state = self.state[p]
+                if len(state) == 0:
+                    state["step"] = 0
+                    state["m"] = torch.zeros_like(p)
+                    state["v"] = torch.zeros_like(p)
+                state["step"] += 1
+                b1, b2 = group["betas"]
+                state["m"].mul_(b1).add_(grad, alpha=1 - b1)
+                state["v"].mul_(b2).addcmul_(grad, grad, value=1 - b2)
+                m_hat = state["m"] / (1 - b1 ** state["step"])
+                v_hat = state["v"] / (1 - b2 ** state["step"])
+                update = m_hat / (v_hat.sqrt() + group["eps"])
+                if group["weight_decay"] > 0:
+                    update.add_(p, alpha=group["weight_decay"])
+                # LAMB trust ratio
+                p_norm = p.norm(2)
+                u_norm = update.norm(2)
+                trust = p_norm / u_norm if p_norm > 0 and u_norm > 0 else 1.0
+                p.add_(update, alpha=-group["lr"] * trust)
 
 
 class DropPath(nn.Module):
@@ -876,12 +935,59 @@ if __name__ == "__main__":
     num_params = sum(p.numel() for p in model.parameters())
     print(f"Parameters: {num_params:,}")
 
+    # Build parameter groups with optional layer-wise LR decay
+    def _get_param_groups(model, lr, wd, layer_decay):
+        if layer_decay >= 1.0:
+            return [{"params": model.parameters(), "lr": lr, "weight_decay": wd}]
+        # Assign lower LR to earlier layers
+        groups = {}
+        n_layers_found = 0
+        for name, param in model.named_parameters():
+            if not param.requires_grad:
+                continue
+            # Determine layer depth from parameter name
+            depth = 0
+            if "layers." in name or "encoder.layers." in name:
+                parts = name.split(".")
+                for i, p in enumerate(parts):
+                    if p in ("layers",) and i + 1 < len(parts):
+                        try:
+                            depth = int(parts[i + 1]) + 1
+                            n_layers_found = max(n_layers_found, depth)
+                        except ValueError:
+                            pass
+                        break
+            elif "head" in name or "ln" in name:
+                depth = 999  # top layers get full LR
+            groups.setdefault(depth, []).append(param)
+        if n_layers_found == 0:
+            return [{"params": model.parameters(), "lr": lr, "weight_decay": wd}]
+        param_groups = []
+        for depth, params in sorted(groups.items()):
+            scale = layer_decay ** max(0, n_layers_found - min(depth, n_layers_found))
+            param_groups.append({"params": params, "lr": lr * scale, "weight_decay": wd})
+        return param_groups
+
+    _param_groups = _get_param_groups(model, LEARNING_RATE, WEIGHT_DECAY, LR_LAYER_DECAY)
+
     # Optimizer
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=LEARNING_RATE,
-        weight_decay=WEIGHT_DECAY,
-    )
+    if OPTIMIZER == "sgd":
+        optimizer = torch.optim.SGD(_param_groups, lr=LEARNING_RATE, momentum=0.9)
+    elif OPTIMIZER == "lamb":
+        optimizer = LAMB(_param_groups, lr=LEARNING_RATE)
+    else:  # adamw
+        optimizer = torch.optim.AdamW(_param_groups, lr=LEARNING_RATE)
+
+    # Resume from checkpoint
+    _resume_step = 0
+    if RESUME_FROM and os.path.exists(RESUME_FROM):
+        print(f"Resuming from {RESUME_FROM}...")
+        ckpt = torch.load(RESUME_FROM, map_location=device, weights_only=False)
+        model.load_state_dict(ckpt["model_state_dict"])
+        if "optimizer_state_dict" in ckpt:
+            optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        _resume_step = ckpt.get("step", 0)
+        print(f"  Resumed at step {_resume_step}")
 
     # Loss function
     _ls = LABEL_SMOOTHING
@@ -889,11 +995,11 @@ if __name__ == "__main__":
         criterion = nn.CrossEntropyLoss(ignore_index=PAD_TOKEN_ID, label_smoothing=_ls)
     elif task_type == "classify":
         class_weights = config.get("class_weights")
-        if class_weights:
-            criterion = nn.CrossEntropyLoss(
-                weight=torch.tensor(class_weights, dtype=torch.float32, device=device),
-                label_smoothing=_ls,
-            )
+        _cw = torch.tensor(class_weights, dtype=torch.float32, device=device) if class_weights else None
+        if LOSS_FN == "focal":
+            criterion = FocalLoss(gamma=FOCAL_GAMMA, weight=_cw, label_smoothing=_ls)
+        elif _cw is not None:
+            criterion = nn.CrossEntropyLoss(weight=_cw, label_smoothing=_ls)
         else:
             criterion = nn.CrossEntropyLoss(label_smoothing=_ls)
     else:
@@ -1349,6 +1455,8 @@ if __name__ == "__main__":
 
     checkpoint = {
         "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "step": step,
         "model_type": MODEL_TYPE,
         "model_config": {
             "vocab_size": vocab_size,

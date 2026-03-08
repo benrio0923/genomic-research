@@ -325,20 +325,19 @@ Priority: MEDIUM-HIGH — better training efficiency and convergence.
 - [ ] Verify implementation matches original paper
 - [ ] File: `genomic_research/templates/train.py`
 
-### T54: Add LAMB optimizer option
-- [ ] Layer-wise Adaptive Moments for large-batch training
-- [ ] Add `OPTIMIZER = "adamw" | "lamb" | "sgd"` hyperparameter
-- [ ] File: `genomic_research/templates/train.py`
+### T54: Add LAMB optimizer option ✅
+- [x] `OPTIMIZER` hyperparameter: adamw, sgd, lamb
+- [x] LAMB class with trust ratio scaling
+- [x] File: `genomic_research/templates/train.py`
 
 ### T55: Implement label smoothing ✅
 - [x] `LABEL_SMOOTHING` hyperparameter applied to all CrossEntropyLoss instances
 - [x] File: `genomic_research/templates/train.py`
 
-### T56: Implement focal loss for classification
-- [ ] Better handling of hard-to-classify examples
-- [ ] Add `LOSS_FN = "cross_entropy" | "focal"` hyperparameter
-- [ ] Add `FOCAL_GAMMA = 2.0` hyperparameter
-- [ ] File: `genomic_research/templates/train.py`
+### T56: Implement focal loss for classification ✅
+- [x] `FocalLoss` class with configurable gamma and label smoothing
+- [x] `LOSS_FN`, `FOCAL_GAMMA` hyperparameters
+- [x] File: `genomic_research/templates/train.py`
 
 ### T57: Implement curriculum learning
 - [ ] Start with shorter sequences, gradually increase length
@@ -351,10 +350,10 @@ Priority: MEDIUM-HIGH — better training efficiency and convergence.
 - [ ] Add `USE_RDROP = True/False`, `RDROP_ALPHA = 1.0`
 - [ ] File: `genomic_research/templates/train.py`
 
-### T59: Add layer-wise learning rate decay
-- [ ] Lower LR for earlier layers, higher for later layers
-- [ ] Add `LR_LAYER_DECAY = 0.75` (multiplier per layer)
-- [ ] File: `genomic_research/templates/train.py`
+### T59: Add layer-wise learning rate decay ✅
+- [x] `LR_LAYER_DECAY` hyperparameter (1.0 = uniform, <1.0 = lower for earlier layers)
+- [x] Auto-detects layer depth from parameter names
+- [x] File: `genomic_research/templates/train.py`
 
 ### T60: Implement progressive resizing
 - [ ] Start training with shorter max_length, increase over time
@@ -395,10 +394,10 @@ Priority: MEDIUM-HIGH — better training efficiency and convergence.
 - [x] Stops training after N evals without improvement, still respects time budget
 - [x] File: `genomic_research/templates/train.py`
 
-### T67: Add training resume from checkpoint
-- [ ] Load optimizer state, scheduler state, step count from checkpoint
-- [ ] Add `--resume` flag or `RESUME_FROM` config option
-- [ ] File: `genomic_research/templates/train.py`
+### T67: Add training resume from checkpoint ✅
+- [x] `RESUME_FROM` config option loads model + optimizer state
+- [x] Checkpoint now saves optimizer_state_dict and step
+- [x] File: `genomic_research/templates/train.py`
 
 ### T68: Implement knowledge distillation
 - [ ] Large model (teacher) → small model (student)
