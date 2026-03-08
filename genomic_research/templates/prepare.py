@@ -87,14 +87,49 @@ def _load_fasta(path):
     return sequences
 
 
-def _load_fastq(path):
-    """Load sequences from FASTQ file using BioPython."""
+def _load_fastq(path, min_quality=0, min_length=0):
+    """Load sequences from FASTQ file using BioPython with optional QC filtering.
+
+    Args:
+        min_quality: Minimum mean Phred quality score (0 = no filtering).
+        min_length: Minimum sequence length after trimming (0 = no filtering).
+    """
     from Bio import SeqIO
     sequences = []
+    n_total = 0
+    n_filtered_quality = 0
+    n_filtered_length = 0
+    quality_scores = []
+
     for record in SeqIO.parse(path, "fastq"):
+        n_total += 1
+        quals = record.letter_annotations.get("phred_quality", [])
+        if quals:
+            mean_q = sum(quals) / len(quals)
+            quality_scores.append(mean_q)
+            if min_quality > 0 and mean_q < min_quality:
+                n_filtered_quality += 1
+                continue
+
         seq = _clean_sequence(str(record.seq))
+        if min_length > 0 and len(seq) < min_length:
+            n_filtered_length += 1
+            continue
         if len(seq) > 0:
             sequences.append((record.id, seq))
+
+    # Print QC summary
+    if n_total > 0:
+        print(f"FASTQ QC: {n_total} reads total")
+        if quality_scores:
+            q_arr = np.array(quality_scores)
+            print(f"  Mean quality: {q_arr.mean():.1f} (min={q_arr.min():.1f}, max={q_arr.max():.1f})")
+        if n_filtered_quality > 0:
+            print(f"  Filtered (quality < {min_quality}): {n_filtered_quality}")
+        if n_filtered_length > 0:
+            print(f"  Filtered (length < {min_length}): {n_filtered_length}")
+        print(f"  Passed: {len(sequences)}")
+
     return sequences
 
 
@@ -560,13 +595,23 @@ def load_data(device="cpu"):
     return data
 
 
-def make_dataloader(tokens, mask, batch_size, shuffle=True, drop_last=False, labels=None):
-    """Create a PyTorch DataLoader from token tensors."""
+def make_dataloader(tokens, mask, batch_size, shuffle=True, drop_last=False, labels=None,
+                    num_workers=0, pin_memory=False):
+    """Create a PyTorch DataLoader from token tensors.
+
+    Args:
+        num_workers: Number of data loading workers (0 = main process only).
+        pin_memory: Pin memory for faster CUDA transfer (set True for GPU training).
+    """
     if labels is not None:
         dataset = TensorDataset(tokens, mask, labels)
     else:
         dataset = TensorDataset(tokens, mask)
-    return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, drop_last=drop_last)
+    return DataLoader(
+        dataset, batch_size=batch_size, shuffle=shuffle, drop_last=drop_last,
+        num_workers=num_workers, pin_memory=pin_memory,
+        persistent_workers=num_workers > 0,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -680,6 +725,7 @@ def _evaluate_classify(model, val_tokens, val_mask, val_labels, batch_size, devi
     loader = DataLoader(TensorDataset(val_tokens, val_mask, val_labels), batch_size=batch_size, shuffle=False)
 
     all_preds = []
+    all_probs = []
     all_targets = []
 
     for tokens_batch, mask_batch, labels_batch in loader:
@@ -688,11 +734,14 @@ def _evaluate_classify(model, val_tokens, val_mask, val_labels, batch_size, devi
         labels_batch = labels_batch.to(device)
 
         logits = model(tokens_batch, attention_mask=mask_batch)  # (B, n_classes)
+        probs = torch.softmax(logits, dim=-1)
         preds = logits.argmax(dim=-1)
         all_preds.append(preds.cpu())
+        all_probs.append(probs.cpu())
         all_targets.append(labels_batch.cpu())
 
     all_preds = torch.cat(all_preds).numpy()
+    all_probs = torch.cat(all_probs).numpy()
     all_targets = torch.cat(all_targets).numpy()
 
     accuracy = float((all_preds == all_targets).mean())
@@ -728,7 +777,18 @@ def _evaluate_classify(model, val_tokens, val_mask, val_labels, batch_size, devi
     for pred, true in zip(all_preds, all_targets):
         cm[int(true), int(pred)] += 1
 
-    return {
+    # ROC-AUC (one-vs-rest for multi-class)
+    roc_auc = None
+    try:
+        from sklearn.metrics import roc_auc_score
+        if n_classes == 2:
+            roc_auc = float(roc_auc_score(all_targets, all_probs[:, 1]))
+        elif n_classes > 2 and len(np.unique(all_targets)) > 1:
+            roc_auc = float(roc_auc_score(all_targets, all_probs, multi_class="ovr", average="macro"))
+    except (ValueError, ImportError):
+        pass
+
+    result = {
         "val_score": accuracy,
         "val_accuracy": accuracy,
         "val_f1_macro": float(macro_f1),
@@ -739,8 +799,12 @@ def _evaluate_classify(model, val_tokens, val_mask, val_labels, batch_size, devi
         "confusion_matrix": cm.tolist(),
         "predictions": all_preds,
         "targets": all_targets,
+        "probabilities": all_probs,
         "metric_direction": "higher_is_better",
     }
+    if roc_auc is not None:
+        result["val_roc_auc"] = roc_auc
+    return result
 
 
 def _evaluate_regress(model, val_tokens, val_mask, val_labels, batch_size, device):
@@ -772,16 +836,36 @@ def _evaluate_regress(model, val_tokens, val_mask, val_labels, batch_size, devic
     ss_tot = float(((all_targets - y_mean) ** 2).sum())
     r2 = 1 - (ss_res / ss_tot) if ss_tot > 0 else 0.0
 
-    return {
+    # Spearman rank correlation
+    spearman_r = None
+    try:
+        from scipy.stats import spearmanr
+        corr, _ = spearmanr(all_preds, all_targets)
+        if not np.isnan(corr):
+            spearman_r = float(corr)
+    except ImportError:
+        pass
+
+    # Pearson correlation
+    if len(all_targets) > 1 and np.std(all_targets) > 0 and np.std(all_preds) > 0:
+        pearson_r = float(np.corrcoef(all_preds, all_targets)[0, 1])
+    else:
+        pearson_r = 0.0
+
+    result = {
         "val_score": -mse,
         "val_mse": mse,
         "val_rmse": rmse,
         "val_mae": mae,
         "val_r2": float(r2),
+        "val_pearson_r": pearson_r,
         "predictions": all_preds,
         "targets": all_targets,
         "metric_direction": "higher_is_better",
     }
+    if spearman_r is not None:
+        result["val_spearman_r"] = spearman_r
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -789,8 +873,13 @@ def _evaluate_regress(model, val_tokens, val_mask, val_labels, batch_size, devic
 # ---------------------------------------------------------------------------
 
 def generate_report(results, task_type, config, training_history=None,
-                    report_dir="reports", run_info=None):
-    """Generate experiment report with plots and metrics."""
+                    report_dir="reports", run_info=None, embeddings=None, embed_labels=None):
+    """Generate experiment report with plots and metrics.
+
+    Args:
+        embeddings: Optional (N, D) numpy array of sequence embeddings for t-SNE.
+        embed_labels: Optional (N,) labels for coloring t-SNE points.
+    """
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -846,9 +935,40 @@ def generate_report(results, task_type, config, training_history=None,
     elif task_type == "regress":
         _generate_regression_report(results, config, preds, targets, report_dir)
 
+    # --- Embedding t-SNE visualization ---
+    if embeddings is not None and len(embeddings) > 10:
+        try:
+            from sklearn.manifold import TSNE
+            perp = min(30, len(embeddings) - 1)
+            tsne = TSNE(n_components=2, perplexity=perp, random_state=42)
+            coords = tsne.fit_transform(embeddings)
+
+            fig, ax = plt.subplots(figsize=(8, 8))
+            if embed_labels is not None:
+                unique_labels = np.unique(embed_labels)
+                colors = plt.cm.tab10(np.linspace(0, 1, min(len(unique_labels), 10)))
+                for i, label in enumerate(unique_labels[:10]):
+                    mask = embed_labels == label
+                    lbl = target_names[int(label)] if int(label) < len(target_names) else str(label)
+                    ax.scatter(coords[mask, 0], coords[mask, 1], c=[colors[i % 10]],
+                              label=lbl, alpha=0.6, s=15, edgecolors="none")
+                ax.legend(fontsize=8, markerscale=2)
+            else:
+                ax.scatter(coords[:, 0], coords[:, 1], alpha=0.5, s=15,
+                          color="#2196F3", edgecolors="none")
+            ax.set_title("Embedding t-SNE")
+            ax.set_xlabel("t-SNE 1")
+            ax.set_ylabel("t-SNE 2")
+            ax.grid(True, alpha=0.3)
+            fig.tight_layout()
+            fig.savefig(os.path.join(report_dir, "embedding_tsne.png"), dpi=150)
+            plt.close(fig)
+        except (ImportError, Exception):
+            pass
+
     # --- Save metrics JSON ---
     metrics_to_save = {k: v for k, v in results.items()
-                       if k not in ("predictions", "targets")}
+                       if k not in ("predictions", "targets", "probabilities")}
     if run_info:
         metrics_to_save["run_info"] = run_info
     with open(os.path.join(report_dir, "metrics.json"), "w") as f:

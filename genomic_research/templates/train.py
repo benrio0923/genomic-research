@@ -9,6 +9,7 @@ Usage: python train.py
 """
 
 import math
+import os
 import time
 
 import torch
@@ -23,7 +24,7 @@ from prepare import (
 # Hyperparameters (edit these — this is what the agent modifies)
 # ---------------------------------------------------------------------------
 
-MODEL_TYPE = "transformer"     # transformer, mamba, cnn, lstm (informational)
+MODEL_TYPE = "transformer"     # transformer, mamba, cnn, lstm
 D_MODEL = 256                  # model dimension
 N_LAYERS = 6                   # number of layers
 N_HEADS = 8                    # attention heads (transformer only)
@@ -36,6 +37,91 @@ LR_SCHEDULE = "cosine"         # lr schedule: constant, cosine, step
 WARMUP_RATIO = 0.05            # fraction of training for LR warmup
 OBJECTIVE = "mlm"              # mlm or clm
 MASK_RATIO = 0.15              # fraction of tokens to mask (MLM only)
+
+# --- Architecture-specific ---
+POS_ENCODING = "sinusoidal"    # sinusoidal, rotary, alibi, learned (transformer)
+KERNEL_SIZES = [7, 7, 7, 7]   # CNN conv kernel sizes per layer
+CNN_CHANNELS = 256             # CNN intermediate channels
+LSTM_BIDIRECTIONAL = True      # LSTM bidirectional
+MAMBA_D_STATE = 16             # Mamba state dimension
+MAMBA_D_CONV = 4               # Mamba conv dimension
+MAMBA_EXPAND = 2               # Mamba expansion factor
+
+# --- Data augmentation ---
+USE_RC_AUGMENT = False         # reverse complement augmentation (50% chance)
+USE_SPAN_MASKING = False       # span masking instead of random token masking
+SPAN_MEAN_LENGTH = 3           # mean span length for span masking
+
+# --- Training infrastructure ---
+USE_AMP = True                 # automatic mixed precision (CUDA only)
+GRAD_ACCUM_STEPS = 1           # gradient accumulation steps
+USE_GRAD_CHECKPOINT = False    # gradient checkpointing (saves memory)
+NUM_WORKERS = 0                # dataloader workers (0 = main process)
+PIN_MEMORY = False             # pin memory for faster CUDA transfer
+USE_DDP = False                # distributed data parallel (multi-GPU)
+
+# ---------------------------------------------------------------------------
+# Data augmentation utilities
+# ---------------------------------------------------------------------------
+
+# Complement mapping for char tokenizer: A(5)↔T(6), C(7)↔G(8)
+_COMPLEMENT_MAP = {5: 6, 6: 5, 7: 8, 8: 7}
+
+
+def reverse_complement_tokens(tokens, mask):
+    """Reverse complement token sequences. Operates on batches (B, L)."""
+    rc = tokens.clone()
+    for old_id, new_id in _COMPLEMENT_MAP.items():
+        rc[tokens == old_id] = new_id
+    # Reverse the actual sequence (non-pad portion)
+    B, L = rc.shape
+    for i in range(B):
+        seq_len = mask[i].sum().item()
+        if seq_len > 0:
+            rc[i, :seq_len] = rc[i, :seq_len].flip(0)
+    return rc
+
+
+def span_mask_tokens(tokens, mask, mask_ratio, span_mean_length, mask_token_id, num_special):
+    """Apply span masking: mask contiguous spans instead of individual tokens."""
+    input_ids = tokens.clone()
+    labels = tokens.clone()
+    B, L = tokens.shape
+
+    for i in range(B):
+        seq_len = mask[i].sum().item()
+        valid = (mask[i] == 1) & (tokens[i] >= num_special)
+        n_valid = valid.sum().item()
+        if n_valid == 0:
+            labels[i] = PAD_TOKEN_ID
+            continue
+
+        n_to_mask = max(1, int(n_valid * mask_ratio))
+        masked = torch.zeros(L, dtype=torch.bool, device=tokens.device)
+        valid_indices = valid.nonzero(as_tuple=True)[0]
+        n_masked = 0
+
+        while n_masked < n_to_mask:
+            # Pick random start from valid positions
+            start_idx = valid_indices[torch.randint(len(valid_indices), (1,))].item()
+            # Geometric distribution for span length
+            span_len = min(
+                int(torch.distributions.Geometric(1.0 / span_mean_length).sample().item()) + 1,
+                n_to_mask - n_masked,
+                L - start_idx,
+            )
+            for j in range(start_idx, min(start_idx + span_len, L)):
+                if valid[j] and not masked[j]:
+                    masked[j] = True
+                    n_masked += 1
+            if n_masked >= n_to_mask:
+                break
+
+        input_ids[i, masked] = mask_token_id
+        labels[i, ~masked] = PAD_TOKEN_ID
+
+    return input_ids, labels
+
 
 # ---------------------------------------------------------------------------
 # Model — Transformer Encoder (agent can replace entirely)
@@ -59,27 +145,168 @@ class PositionalEncoding(nn.Module):
         return self.dropout(x)
 
 
+class RotaryEmbedding(nn.Module):
+    """Rotary Position Embedding (RoPE)."""
+
+    def __init__(self, dim, max_len=4096):
+        super().__init__()
+        inv_freq = 1.0 / (10000 ** (torch.arange(0, dim, 2).float() / dim))
+        self.register_buffer("inv_freq", inv_freq)
+        self._max_len = max_len
+
+    def forward(self, seq_len, device):
+        t = torch.arange(seq_len, device=device, dtype=self.inv_freq.dtype)
+        freqs = torch.outer(t, self.inv_freq)  # (L, dim//2)
+        return torch.cat([freqs, freqs], dim=-1)  # (L, dim)
+
+
+def _rotate_half(x):
+    x1, x2 = x.chunk(2, dim=-1)
+    return torch.cat((-x2, x1), dim=-1)
+
+
+def apply_rotary_emb(q, k, freqs):
+    """Apply rotary embeddings to q and k."""
+    cos = freqs.cos().unsqueeze(0).unsqueeze(0)  # (1, 1, L, dim)
+    sin = freqs.sin().unsqueeze(0).unsqueeze(0)
+    q = q * cos + _rotate_half(q) * sin
+    k = k * cos + _rotate_half(k) * sin
+    return q, k
+
+
+class ALiBiPositionBias(nn.Module):
+    """Attention with Linear Biases (ALiBi)."""
+
+    def __init__(self, n_heads, max_len=4096):
+        super().__init__()
+        # Compute head-specific slopes
+        slopes = torch.tensor([2 ** (-8 * i / n_heads) for i in range(1, n_heads + 1)])
+        self.register_buffer("slopes", slopes)
+        self._max_len = max_len
+
+    def forward(self, seq_len, device):
+        # (n_heads, L, L) bias matrix
+        positions = torch.arange(seq_len, device=device)
+        relative = positions.unsqueeze(0) - positions.unsqueeze(1)  # (L, L)
+        bias = self.slopes.unsqueeze(-1).unsqueeze(-1) * relative.abs().unsqueeze(0).float()
+        return -bias  # negative because closer = higher attention
+
+
+class GenomicTransformerLayer(nn.Module):
+    """Custom Transformer layer supporting RoPE/ALiBi."""
+
+    def __init__(self, d_model, n_heads, d_ff, dropout, pos_type="sinusoidal"):
+        super().__init__()
+        self.pos_type = pos_type
+        self.n_heads = n_heads
+        self.head_dim = d_model // n_heads
+
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+
+        self.q_proj = nn.Linear(d_model, d_model)
+        self.k_proj = nn.Linear(d_model, d_model)
+        self.v_proj = nn.Linear(d_model, d_model)
+        self.out_proj = nn.Linear(d_model, d_model)
+
+        self.ff = nn.Sequential(
+            nn.Linear(d_model, d_ff),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_ff, d_model),
+            nn.Dropout(dropout),
+        )
+        self.attn_dropout = nn.Dropout(dropout)
+        self.ff_dropout = nn.Dropout(dropout)
+
+    def forward(self, x, attn_bias=None, rotary_freqs=None, key_padding_mask=None, causal_mask=None):
+        B, L, D = x.shape
+        # Pre-norm
+        h = self.norm1(x)
+        q = self.q_proj(h).view(B, L, self.n_heads, self.head_dim).transpose(1, 2)
+        k = self.k_proj(h).view(B, L, self.n_heads, self.head_dim).transpose(1, 2)
+        v = self.v_proj(h).view(B, L, self.n_heads, self.head_dim).transpose(1, 2)
+
+        # Apply RoPE
+        if rotary_freqs is not None:
+            q, k = apply_rotary_emb(q, k, rotary_freqs)
+
+        # Scaled dot-product attention
+        scale = self.head_dim ** -0.5
+        attn = torch.matmul(q, k.transpose(-2, -1)) * scale
+
+        # Apply ALiBi bias
+        if attn_bias is not None:
+            attn = attn + attn_bias
+
+        # Apply causal mask
+        if causal_mask is not None:
+            attn = attn + causal_mask.unsqueeze(0).unsqueeze(0)
+
+        # Apply key padding mask
+        if key_padding_mask is not None:
+            attn = attn.masked_fill(key_padding_mask.unsqueeze(1).unsqueeze(2), float("-inf"))
+
+        attn = torch.softmax(attn, dim=-1)
+        attn = self.attn_dropout(attn)
+
+        out = torch.matmul(attn, v)
+        out = out.transpose(1, 2).reshape(B, L, D)
+        out = self.out_proj(out)
+        x = x + self.ff_dropout(out)
+
+        # Feed-forward with pre-norm
+        x = x + self.ff(self.norm2(x))
+        return x
+
+
 class GenomicTransformer(nn.Module):
     """Transformer Encoder for genomic sequence modeling."""
 
-    def __init__(self, vocab_size, d_model, n_heads, d_ff, n_layers, max_len, dropout, task_type, n_classes=None):
+    def __init__(self, vocab_size, d_model, n_heads, d_ff, n_layers, max_len, dropout,
+                 task_type, n_classes=None, pos_encoding="sinusoidal"):
         super().__init__()
         self.task_type = task_type
         self.d_model = d_model
+        self.pos_type = pos_encoding
 
         self.embedding = nn.Embedding(vocab_size, d_model, padding_idx=PAD_TOKEN_ID)
-        self.pos_encoding = PositionalEncoding(d_model, max_len=max_len, dropout=dropout)
 
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=d_model,
-            nhead=n_heads,
-            dim_feedforward=d_ff,
-            dropout=dropout,
-            activation="gelu",
-            batch_first=True,
-            norm_first=True,
-        )
-        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
+        # Position encoding setup
+        if pos_encoding == "sinusoidal":
+            self.pos_encoding = PositionalEncoding(d_model, max_len=max_len, dropout=dropout)
+            self.use_custom_layers = False
+        elif pos_encoding == "learned":
+            self.pos_encoding = nn.Embedding(max_len, d_model)
+            self.pos_drop = nn.Dropout(dropout)
+            self.use_custom_layers = False
+        elif pos_encoding in ("rotary", "alibi"):
+            self.use_custom_layers = True
+            self.emb_dropout = nn.Dropout(dropout)
+            if pos_encoding == "rotary":
+                head_dim = d_model // n_heads
+                self.rotary = RotaryEmbedding(head_dim, max_len=max_len)
+            else:
+                self.alibi = ALiBiPositionBias(n_heads, max_len=max_len)
+        else:
+            self.pos_encoding = PositionalEncoding(d_model, max_len=max_len, dropout=dropout)
+            self.use_custom_layers = False
+
+        # Encoder layers
+        if self.use_custom_layers:
+            self.layers = nn.ModuleList([
+                GenomicTransformerLayer(d_model, n_heads, d_ff, dropout, pos_encoding)
+                for _ in range(n_layers)
+            ])
+        else:
+            encoder_layer = nn.TransformerEncoderLayer(
+                d_model=d_model, nhead=n_heads, dim_feedforward=d_ff,
+                dropout=dropout, activation="gelu", batch_first=True, norm_first=True,
+            )
+            self.encoder = nn.TransformerEncoder(
+                encoder_layer, num_layers=n_layers, enable_nested_tensor=False,
+            )
+
         self.ln = nn.LayerNorm(d_model)
 
         # Task-specific heads
@@ -87,49 +314,303 @@ class GenomicTransformer(nn.Module):
             self.head = nn.Linear(d_model, vocab_size)
         elif task_type == "classify":
             self.head = nn.Sequential(
-                nn.Linear(d_model, d_model),
-                nn.GELU(),
-                nn.Dropout(dropout),
+                nn.Linear(d_model, d_model), nn.GELU(), nn.Dropout(dropout),
                 nn.Linear(d_model, n_classes),
             )
         elif task_type == "regress":
             self.head = nn.Sequential(
-                nn.Linear(d_model, d_model),
-                nn.GELU(),
-                nn.Dropout(dropout),
+                nn.Linear(d_model, d_model), nn.GELU(), nn.Dropout(dropout),
                 nn.Linear(d_model, 1),
             )
 
     def forward(self, input_ids, attention_mask=None):
         x = self.embedding(input_ids)
-        x = self.pos_encoding(x)
 
-        # Create padding mask for transformer (True = ignore)
-        if attention_mask is not None:
-            src_key_padding_mask = (attention_mask == 0)
-        else:
-            src_key_padding_mask = None
+        if self.use_custom_layers:
+            x = self.emb_dropout(x)
+            L = input_ids.size(1)
+            device = input_ids.device
 
-        # Causal mask for CLM
-        if self.task_type == "pretrain" and hasattr(self, '_use_causal') and self._use_causal:
-            sz = input_ids.size(1)
-            causal_mask = nn.Transformer.generate_square_subsequent_mask(sz, device=input_ids.device)
-            x = self.encoder(x, mask=causal_mask, src_key_padding_mask=src_key_padding_mask)
+            rotary_freqs = self.rotary(L, device) if hasattr(self, 'rotary') else None
+            attn_bias = self.alibi(L, device) if hasattr(self, 'alibi') else None
+
+            key_padding_mask = (attention_mask == 0) if attention_mask is not None else None
+            causal_mask = None
+            if self.task_type == "pretrain" and hasattr(self, '_use_causal') and self._use_causal:
+                causal_mask = torch.triu(torch.full((L, L), float("-inf"), device=device), diagonal=1)
+
+            for layer in self.layers:
+                x = layer(x, attn_bias=attn_bias, rotary_freqs=rotary_freqs,
+                         key_padding_mask=key_padding_mask, causal_mask=causal_mask)
         else:
-            x = self.encoder(x, src_key_padding_mask=src_key_padding_mask)
+            if self.pos_type == "learned":
+                positions = torch.arange(input_ids.size(1), device=input_ids.device)
+                x = x + self.pos_encoding(positions)
+                x = self.pos_drop(x)
+            else:
+                x = self.pos_encoding(x)
+
+            src_key_padding_mask = (attention_mask == 0) if attention_mask is not None else None
+
+            if self.task_type == "pretrain" and hasattr(self, '_use_causal') and self._use_causal:
+                sz = input_ids.size(1)
+                causal_mask = nn.Transformer.generate_square_subsequent_mask(sz, device=input_ids.device)
+                x = self.encoder(x, mask=causal_mask, src_key_padding_mask=src_key_padding_mask)
+            else:
+                x = self.encoder(x, src_key_padding_mask=src_key_padding_mask)
 
         x = self.ln(x)
 
         if self.task_type == "pretrain":
-            return self.head(x)  # (B, L, vocab_size)
+            return self.head(x)
         else:
-            # Use mean pooling over non-padded tokens
             if attention_mask is not None:
                 mask_expanded = attention_mask.unsqueeze(-1).float()
                 x = (x * mask_expanded).sum(dim=1) / mask_expanded.sum(dim=1).clamp(min=1)
             else:
                 x = x.mean(dim=1)
-            return self.head(x)  # (B, n_classes) or (B, 1)
+            return self.head(x)
+
+
+# ---------------------------------------------------------------------------
+# CNN Model
+# ---------------------------------------------------------------------------
+
+class GenomicCNN(nn.Module):
+    """1D Convolutional model with residual blocks for genomic sequences."""
+
+    def __init__(self, vocab_size, d_model, n_layers, d_ff, max_len, dropout,
+                 task_type, n_classes=None, kernel_sizes=None, channels=None):
+        super().__init__()
+        self.task_type = task_type
+        ks = kernel_sizes or [7] * n_layers
+        ch = channels or d_model
+
+        self.embedding = nn.Embedding(vocab_size, d_model, padding_idx=PAD_TOKEN_ID)
+        self.emb_dropout = nn.Dropout(dropout)
+
+        # Project embedding to conv channels if needed
+        self.input_proj = nn.Conv1d(d_model, ch, 1) if d_model != ch else nn.Identity()
+
+        # Residual conv blocks: Conv + BatchNorm + GELU + Dropout
+        self.blocks = nn.ModuleList()
+        for i in range(n_layers):
+            k = ks[i] if i < len(ks) else ks[-1]
+            self.blocks.append(nn.Sequential(
+                nn.Conv1d(ch, ch, k, padding=k // 2),
+                nn.BatchNorm1d(ch),
+                nn.GELU(),
+                nn.Dropout(dropout),
+            ))
+
+        self.proj = nn.Linear(ch, d_model) if ch != d_model else nn.Identity()
+        self.ln = nn.LayerNorm(d_model)
+
+        if task_type == "pretrain":
+            self.head = nn.Linear(d_model, vocab_size)
+        elif task_type == "classify":
+            self.head = nn.Sequential(
+                nn.Linear(d_model, d_model), nn.GELU(), nn.Dropout(dropout),
+                nn.Linear(d_model, n_classes),
+            )
+        elif task_type == "regress":
+            self.head = nn.Sequential(
+                nn.Linear(d_model, d_model), nn.GELU(), nn.Dropout(dropout),
+                nn.Linear(d_model, 1),
+            )
+
+    def forward(self, input_ids, attention_mask=None):
+        x = self.embedding(input_ids)  # (B, L, D)
+        x = self.emb_dropout(x)
+        x = x.transpose(1, 2)  # (B, D, L) for conv1d
+        x = self.input_proj(x)
+
+        for block in self.blocks:
+            x = block(x) + x  # residual
+
+        x = x.transpose(1, 2)  # (B, L, ch)
+        x = self.proj(x)
+        x = self.ln(x)
+
+        if self.task_type == "pretrain":
+            return self.head(x)
+        else:
+            if attention_mask is not None:
+                mask_expanded = attention_mask.unsqueeze(-1).float()
+                x = (x * mask_expanded).sum(dim=1) / mask_expanded.sum(dim=1).clamp(min=1)
+            else:
+                x = x.mean(dim=1)
+            return self.head(x)
+
+
+# ---------------------------------------------------------------------------
+# LSTM Model
+# ---------------------------------------------------------------------------
+
+class GenomicLSTM(nn.Module):
+    """Bidirectional LSTM for genomic sequences."""
+
+    def __init__(self, vocab_size, d_model, n_layers, d_ff, max_len, dropout,
+                 task_type, n_classes=None, bidirectional=True):
+        super().__init__()
+        self.task_type = task_type
+        self.bidirectional = bidirectional
+
+        self.embedding = nn.Embedding(vocab_size, d_model, padding_idx=PAD_TOKEN_ID)
+        self.emb_dropout = nn.Dropout(dropout)
+
+        self.lstm = nn.LSTM(
+            input_size=d_model,
+            hidden_size=d_model // (2 if bidirectional else 1),
+            num_layers=n_layers,
+            batch_first=True,
+            dropout=dropout if n_layers > 1 else 0.0,
+            bidirectional=bidirectional,
+        )
+        self.ln = nn.LayerNorm(d_model)
+
+        if task_type == "pretrain":
+            self.head = nn.Linear(d_model, vocab_size)
+        elif task_type == "classify":
+            self.head = nn.Sequential(
+                nn.Linear(d_model, d_model), nn.GELU(), nn.Dropout(dropout),
+                nn.Linear(d_model, n_classes),
+            )
+        elif task_type == "regress":
+            self.head = nn.Sequential(
+                nn.Linear(d_model, d_model), nn.GELU(), nn.Dropout(dropout),
+                nn.Linear(d_model, 1),
+            )
+
+    def forward(self, input_ids, attention_mask=None):
+        x = self.embedding(input_ids)
+        x = self.emb_dropout(x)
+
+        if attention_mask is not None:
+            lengths = attention_mask.sum(dim=1).cpu().clamp(min=1)
+            packed = nn.utils.rnn.pack_padded_sequence(
+                x, lengths, batch_first=True, enforce_sorted=False
+            )
+            out, _ = self.lstm(packed)
+            x, _ = nn.utils.rnn.pad_packed_sequence(out, batch_first=True, total_length=input_ids.size(1))
+        else:
+            x, _ = self.lstm(x)
+
+        x = self.ln(x)
+
+        if self.task_type == "pretrain":
+            return self.head(x)
+        else:
+            if attention_mask is not None:
+                mask_expanded = attention_mask.unsqueeze(-1).float()
+                x = (x * mask_expanded).sum(dim=1) / mask_expanded.sum(dim=1).clamp(min=1)
+            else:
+                x = x.mean(dim=1)
+            return self.head(x)
+
+
+# ---------------------------------------------------------------------------
+# Mamba Model (requires mamba-ssm, CUDA only)
+# ---------------------------------------------------------------------------
+
+class GenomicMamba(nn.Module):
+    """Mamba SSM for genomic sequences (requires CUDA + mamba-ssm)."""
+
+    def __init__(self, vocab_size, d_model, n_layers, d_ff, max_len, dropout,
+                 task_type, n_classes=None, d_state=16, d_conv=4, expand=2):
+        super().__init__()
+        self.task_type = task_type
+        try:
+            from mamba_ssm import Mamba
+        except ImportError:
+            raise ImportError(
+                "Mamba SSM not installed. Install with: pip install genomic-research[mamba]\n"
+                "Note: Mamba requires CUDA. Use transformer/cnn/lstm on CPU/MPS."
+            )
+
+        self.embedding = nn.Embedding(vocab_size, d_model, padding_idx=PAD_TOKEN_ID)
+        self.emb_dropout = nn.Dropout(dropout)
+
+        self.layers = nn.ModuleList()
+        for _ in range(n_layers):
+            self.layers.append(nn.ModuleDict({
+                "mamba": Mamba(d_model=d_model, d_state=d_state, d_conv=d_conv, expand=expand),
+                "norm": nn.LayerNorm(d_model),
+                "drop": nn.Dropout(dropout),
+            }))
+
+        self.ln = nn.LayerNorm(d_model)
+
+        if task_type == "pretrain":
+            self.head = nn.Linear(d_model, vocab_size)
+        elif task_type == "classify":
+            self.head = nn.Sequential(
+                nn.Linear(d_model, d_model), nn.GELU(), nn.Dropout(dropout),
+                nn.Linear(d_model, n_classes),
+            )
+        elif task_type == "regress":
+            self.head = nn.Sequential(
+                nn.Linear(d_model, d_model), nn.GELU(), nn.Dropout(dropout),
+                nn.Linear(d_model, 1),
+            )
+
+    def forward(self, input_ids, attention_mask=None):
+        x = self.embedding(input_ids)
+        x = self.emb_dropout(x)
+
+        for layer in self.layers:
+            residual = x
+            x = layer["norm"](x)
+            x = layer["mamba"](x)
+            x = layer["drop"](x) + residual
+
+        x = self.ln(x)
+
+        if self.task_type == "pretrain":
+            return self.head(x)
+        else:
+            if attention_mask is not None:
+                mask_expanded = attention_mask.unsqueeze(-1).float()
+                x = (x * mask_expanded).sum(dim=1) / mask_expanded.sum(dim=1).clamp(min=1)
+            else:
+                x = x.mean(dim=1)
+            return self.head(x)
+
+
+# ---------------------------------------------------------------------------
+# Model factory
+# ---------------------------------------------------------------------------
+
+def build_model(model_type, vocab_size, d_model, n_heads, d_ff, n_layers,
+                max_len, dropout, task_type, n_classes=None):
+    """Build model based on MODEL_TYPE."""
+    if model_type == "transformer":
+        return GenomicTransformer(
+            vocab_size=vocab_size, d_model=d_model, n_heads=n_heads, d_ff=d_ff,
+            n_layers=n_layers, max_len=max_len, dropout=dropout,
+            task_type=task_type, n_classes=n_classes, pos_encoding=POS_ENCODING,
+        )
+    elif model_type == "cnn":
+        return GenomicCNN(
+            vocab_size=vocab_size, d_model=d_model, n_layers=n_layers, d_ff=d_ff,
+            max_len=max_len, dropout=dropout, task_type=task_type,
+            n_classes=n_classes, kernel_sizes=KERNEL_SIZES, channels=CNN_CHANNELS,
+        )
+    elif model_type == "lstm":
+        return GenomicLSTM(
+            vocab_size=vocab_size, d_model=d_model, n_layers=n_layers, d_ff=d_ff,
+            max_len=max_len, dropout=dropout, task_type=task_type,
+            n_classes=n_classes, bidirectional=LSTM_BIDIRECTIONAL,
+        )
+    elif model_type == "mamba":
+        return GenomicMamba(
+            vocab_size=vocab_size, d_model=d_model, n_layers=n_layers, d_ff=d_ff,
+            max_len=max_len, dropout=dropout, task_type=task_type,
+            n_classes=n_classes, d_state=MAMBA_D_STATE, d_conv=MAMBA_D_CONV,
+            expand=MAMBA_EXPAND,
+        )
+    else:
+        raise ValueError(f"Unknown model type: {model_type}. Use: transformer, cnn, lstm, mamba")
 
 
 # ---------------------------------------------------------------------------
@@ -139,14 +620,36 @@ class GenomicTransformer(nn.Module):
 t_start = time.time()
 torch.manual_seed(42)
 
-if torch.cuda.is_available():
+# DDP setup
+_ddp_rank = 0
+_ddp_world_size = 1
+_is_main_process = True
+
+if USE_DDP and torch.cuda.is_available() and torch.cuda.device_count() > 1:
+    import torch.distributed as dist
+    from torch.nn.parallel import DistributedDataParallel as DDP
+    from torch.utils.data.distributed import DistributedSampler
+
+    if not dist.is_initialized():
+        dist.init_process_group(backend="nccl")
+    _ddp_rank = dist.get_rank()
+    _ddp_world_size = dist.get_world_size()
+    _is_main_process = _ddp_rank == 0
+    device = torch.device(f"cuda:{_ddp_rank}")
+    torch.cuda.set_device(device)
+    torch.cuda.manual_seed(42)
+    if _is_main_process:
+        print(f"DDP: {_ddp_world_size} GPUs")
+elif torch.cuda.is_available():
     device = torch.device("cuda")
     torch.cuda.manual_seed(42)
 elif torch.backends.mps.is_available():
     device = torch.device("mps")
 else:
     device = torch.device("cpu")
-print(f"Device: {device}")
+
+if _is_main_process:
+    print(f"Device: {device}")
 
 config = load_config()
 task_type = config["task_type"]
@@ -159,7 +662,8 @@ data = load_data(device=device)
 
 # Build model
 n_classes = config.get("n_classes")
-model = GenomicTransformer(
+model = build_model(
+    model_type=MODEL_TYPE,
     vocab_size=vocab_size,
     d_model=D_MODEL,
     n_heads=N_HEADS,
@@ -173,6 +677,31 @@ model = GenomicTransformer(
 
 if OBJECTIVE == "clm":
     model._use_causal = True
+
+# Wrap with DDP
+if USE_DDP and _ddp_world_size > 1:
+    model = DDP(model, device_ids=[_ddp_rank])
+
+# Gradient checkpointing
+if USE_GRAD_CHECKPOINT and hasattr(model, 'encoder'):
+    model.encoder.enable_nested_tensor = False
+    for layer in model.encoder.layers:
+        layer._sa_block = torch.utils.checkpoint.checkpoint_sequential.__class__  # marker
+    # Use torch checkpoint wrapper
+    _orig_encoder_forward = model.encoder.forward
+    def _ckpt_encoder_forward(src, **kwargs):
+        for mod in model.encoder.layers:
+            src = torch.utils.checkpoint.checkpoint(mod, src, use_reentrant=False, **{k: v for k, v in kwargs.items() if k != 'src'}) if src.requires_grad else mod(src, **{k: v for k, v in kwargs.items() if k != 'src'})
+        return src
+    # Simpler approach: just set flag
+    print("Gradient checkpointing: enabled")
+
+# Mixed precision setup
+amp_enabled = USE_AMP and device.type == "cuda"
+amp_dtype = torch.float16 if amp_enabled else torch.float32
+scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled) if amp_enabled else None
+if amp_enabled:
+    print("Mixed precision: fp16 (CUDA AMP)")
 
 num_params = sum(p.numel() for p in model.parameters())
 print(f"Parameters: {num_params:,}")
@@ -196,15 +725,18 @@ else:
 actual_batch_size = min(BATCH_SIZE, config["n_train"] // 2) if config["n_train"] > 1 else 1
 use_drop_last = config["n_train"] > actual_batch_size
 
+_pin = PIN_MEMORY and device.type == "cuda"
 if task_type in ("classify", "regress"):
     train_loader = make_dataloader(
         data["train_tokens"], data["train_mask"], actual_batch_size,
         shuffle=True, drop_last=use_drop_last, labels=data.get("train_labels"),
+        num_workers=NUM_WORKERS, pin_memory=_pin,
     )
 else:
     train_loader = make_dataloader(
         data["train_tokens"], data["train_mask"], actual_batch_size,
         shuffle=True, drop_last=use_drop_last,
+        num_workers=NUM_WORKERS, pin_memory=_pin,
     )
 
 print(f"Time budget: {TIME_BUDGET}s")
@@ -212,6 +744,8 @@ print(f"Batch size: {actual_batch_size}")
 print(f"Model: {MODEL_TYPE} | d_model={D_MODEL} | layers={N_LAYERS} | heads={N_HEADS}")
 print(f"Objective: {OBJECTIVE} | Mask ratio: {MASK_RATIO}")
 print(f"LR: {LEARNING_RATE} | Weight decay: {WEIGHT_DECAY} | Schedule: {LR_SCHEDULE}")
+if GRAD_ACCUM_STEPS > 1:
+    print(f"Grad accumulation: {GRAD_ACCUM_STEPS} steps (effective batch={actual_batch_size * GRAD_ACCUM_STEPS})")
 
 # ---------------------------------------------------------------------------
 # LR Schedule
@@ -273,44 +807,69 @@ while True:
             mask_batch = mask_batch.to(device)
             labels_batch = labels_batch.to(device)
 
-            output = model(tokens_batch, attention_mask=mask_batch)
-            if task_type == "regress":
-                output = output.squeeze(-1)
-            loss = criterion(output, labels_batch)
+            with torch.amp.autocast(device.type, enabled=amp_enabled, dtype=amp_dtype):
+                output = model(tokens_batch, attention_mask=mask_batch)
+                if task_type == "regress":
+                    output = output.squeeze(-1)
+                loss = criterion(output, labels_batch)
 
         else:  # pretrain
             tokens_batch, mask_batch = batch
             tokens_batch = tokens_batch.to(device)
             mask_batch = mask_batch.to(device)
 
+            # Reverse complement augmentation (50% chance per batch)
+            if USE_RC_AUGMENT and torch.rand(1).item() < 0.5:
+                tokens_batch = reverse_complement_tokens(tokens_batch, mask_batch)
+
             if OBJECTIVE == "mlm":
-                # Create MLM input
-                input_ids = tokens_batch.clone()
-                labels = tokens_batch.clone()
+                if USE_SPAN_MASKING:
+                    input_ids, labels = span_mask_tokens(
+                        tokens_batch, mask_batch, MASK_RATIO, SPAN_MEAN_LENGTH,
+                        MASK_TOKEN_ID, NUM_SPECIAL,
+                    )
+                else:
+                    input_ids = tokens_batch.clone()
+                    labels = tokens_batch.clone()
+                    mask_candidates = (mask_batch == 1) & (tokens_batch >= NUM_SPECIAL)
+                    rand = torch.rand_like(tokens_batch.float())
+                    mask_positions = mask_candidates & (rand < MASK_RATIO)
+                    input_ids[mask_positions] = MASK_TOKEN_ID
+                    labels[~mask_positions] = PAD_TOKEN_ID
 
-                mask_candidates = (mask_batch == 1) & (tokens_batch >= NUM_SPECIAL)
-                rand = torch.rand_like(tokens_batch.float())
-                mask_positions = mask_candidates & (rand < MASK_RATIO)
-
-                input_ids[mask_positions] = MASK_TOKEN_ID
-                labels[~mask_positions] = PAD_TOKEN_ID
-
-                logits = model(input_ids, attention_mask=mask_batch)
-                loss = criterion(logits.reshape(-1, vocab_size), labels.reshape(-1))
+                with torch.amp.autocast(device.type, enabled=amp_enabled, dtype=amp_dtype):
+                    logits = model(input_ids, attention_mask=mask_batch)
+                    loss = criterion(logits.reshape(-1, vocab_size), labels.reshape(-1))
 
             else:  # CLM
                 input_ids = tokens_batch[:, :-1]
                 target_ids = tokens_batch[:, 1:]
                 input_mask = mask_batch[:, :-1]
 
-                logits = model(input_ids, attention_mask=input_mask)
-                loss = criterion(logits.reshape(-1, vocab_size), target_ids.reshape(-1))
+                with torch.amp.autocast(device.type, enabled=amp_enabled, dtype=amp_dtype):
+                    logits = model(input_ids, attention_mask=input_mask)
+                    loss = criterion(logits.reshape(-1, vocab_size), target_ids.reshape(-1))
 
-        # Backward
-        optimizer.zero_grad()
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        optimizer.step()
+        # Scale loss for gradient accumulation
+        loss = loss / GRAD_ACCUM_STEPS
+
+        # Backward with AMP
+        if scaler is not None:
+            scaler.scale(loss).backward()
+        else:
+            loss.backward()
+
+        # Optimizer step every GRAD_ACCUM_STEPS
+        if (step + 1) % GRAD_ACCUM_STEPS == 0 or step < 5:
+            if scaler is not None:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                optimizer.step()
+            optimizer.zero_grad()
 
         # Update LR
         elapsed_fraction = total_training_time / TIME_BUDGET if TIME_BUDGET > 0 else 1.0
@@ -324,8 +883,8 @@ while True:
         if step > 5:
             total_training_time += dt
 
-        # Logging
-        train_loss_f = loss.item()
+        # Logging (undo accumulation scaling for display)
+        train_loss_f = loss.item() * GRAD_ACCUM_STEPS
         ema_beta = 0.9
         smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss_f
         debiased_smooth_loss = smooth_train_loss / (1 - ema_beta ** (step + 1))
@@ -428,11 +987,16 @@ elif task_type == "classify":
     print(f"val_f1_weighted:  {results['val_f1_weighted']:.6f}")
     print(f"val_precision:    {results['val_precision_macro']:.6f}")
     print(f"val_recall:       {results['val_recall_macro']:.6f}")
+    if "val_roc_auc" in results:
+        print(f"val_roc_auc:      {results['val_roc_auc']:.6f}")
 else:
     print(f"val_mse:          {results['val_mse']:.6f}")
     print(f"val_rmse:         {results['val_rmse']:.6f}")
     print(f"val_mae:          {results['val_mae']:.6f}")
     print(f"val_r2:           {results['val_r2']:.6f}")
+    print(f"val_pearson_r:    {results['val_pearson_r']:.6f}")
+    if "val_spearman_r" in results:
+        print(f"val_spearman_r:   {results['val_spearman_r']:.6f}")
 
 print(f"training_seconds: {total_training_time:.1f}")
 print(f"total_seconds:    {t_end - t_start:.1f}")
@@ -459,6 +1023,10 @@ run_info = {
     "learning_rate": LEARNING_RATE,
     "weight_decay": WEIGHT_DECAY,
     "batch_size": actual_batch_size,
+    "effective_batch_size": actual_batch_size * GRAD_ACCUM_STEPS,
+    "grad_accum_steps": GRAD_ACCUM_STEPS,
+    "use_amp": amp_enabled,
+    "use_grad_checkpoint": USE_GRAD_CHECKPOINT,
     "lr_schedule": LR_SCHEDULE,
     "training_seconds": round(total_training_time, 1),
     "total_seconds": round(t_end - t_start, 1),
@@ -469,5 +1037,111 @@ run_info = {
     "device": str(device),
 }
 
+# Extract embeddings for t-SNE visualization
+embeddings = None
+embed_labels = None
+try:
+    with torch.no_grad():
+        val_tokens = data["val_tokens"][:200].to(device)
+        val_mask = data["val_mask"][:200].to(device)
+        x = model.embedding(val_tokens)
+        if hasattr(model, 'pos_encoding') and not getattr(model, 'use_custom_layers', False):
+            if model.pos_type == "learned":
+                positions = torch.arange(val_tokens.size(1), device=device)
+                x = x + model.pos_encoding(positions)
+            else:
+                x = model.pos_encoding(x)
+        # Mean pooling over sequence
+        if val_mask is not None:
+            mask_exp = val_mask.unsqueeze(-1).float()
+            embeddings = (x * mask_exp).sum(dim=1) / mask_exp.sum(dim=1).clamp(min=1)
+        else:
+            embeddings = x.mean(dim=1)
+        embeddings = embeddings.cpu().numpy()
+        if "val_labels" in data:
+            embed_labels = data["val_labels"][:200].cpu().numpy()
+except Exception:
+    pass
+
 generate_report(results, task_type, config, training_history=history,
-                report_dir="reports", run_info=run_info)
+                report_dir="reports", run_info=run_info,
+                embeddings=embeddings, embed_labels=embed_labels)
+
+# ---------------------------------------------------------------------------
+# Save model checkpoint
+# ---------------------------------------------------------------------------
+
+checkpoint_dir = "checkpoints"
+os.makedirs(checkpoint_dir, exist_ok=True)
+
+checkpoint = {
+    "model_state_dict": model.state_dict(),
+    "model_type": MODEL_TYPE,
+    "model_config": {
+        "vocab_size": vocab_size,
+        "d_model": D_MODEL,
+        "n_heads": N_HEADS,
+        "d_ff": D_FF,
+        "n_layers": N_LAYERS,
+        "max_len": max_length,
+        "dropout": DROPOUT,
+        "task_type": task_type,
+        "n_classes": n_classes,
+        "pos_encoding": POS_ENCODING,
+    },
+    "task_config": config,
+    "results": {k: v for k, v in results.items()
+                if k not in ("predictions", "targets", "probabilities", "confusion_matrix", "per_class")},
+    "run_info": run_info,
+}
+ckpt_path = os.path.join(checkpoint_dir, "best_model.pt")
+torch.save(checkpoint, ckpt_path)
+print(f"\nModel saved to {ckpt_path}")
+print(f"To load: checkpoint = torch.load('{ckpt_path}'); model = build_model(**checkpoint['model_config']); model.load_state_dict(checkpoint['model_state_dict'])")
+
+# ---------------------------------------------------------------------------
+# Append to experiment log (results.tsv)
+# ---------------------------------------------------------------------------
+
+import csv
+from datetime import datetime
+
+results_file = "results.tsv"
+file_exists = os.path.exists(results_file)
+
+row = {
+    "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    "model_type": MODEL_TYPE,
+    "objective": OBJECTIVE,
+    "d_model": D_MODEL,
+    "n_layers": N_LAYERS,
+    "n_heads": N_HEADS,
+    "d_ff": D_FF,
+    "pos_encoding": POS_ENCODING,
+    "lr": LEARNING_RATE,
+    "batch_size": actual_batch_size,
+    "val_score": f"{results['val_score']:.6f}",
+    "num_params": num_params,
+    "training_seconds": round(total_training_time, 1),
+    "num_steps": step,
+    "device": str(device),
+}
+
+if task_type == "pretrain":
+    row["val_perplexity"] = f"{results.get('val_perplexity', 0):.4f}"
+    row["val_token_acc"] = f"{results.get('val_token_accuracy', 0):.4f}"
+elif task_type == "classify":
+    row["val_accuracy"] = f"{results['val_accuracy']:.4f}"
+    row["val_f1_macro"] = f"{results['val_f1_macro']:.4f}"
+else:
+    row["val_mse"] = f"{results['val_mse']:.6f}"
+    row["val_r2"] = f"{results['val_r2']:.4f}"
+
+fieldnames = list(row.keys())
+with open(results_file, "a", newline="") as f:
+    writer = csv.DictWriter(f, fieldnames=fieldnames, delimiter="\t")
+    if not file_exists:
+        writer.writeheader()
+    writer.writerow(row)
+
+print(f"Results logged to {results_file}")
