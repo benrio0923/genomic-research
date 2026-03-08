@@ -67,7 +67,7 @@ def load_sequences(path, seq_col=None, id_col=None):
     # Handle directory input — load all sequence files
     if os.path.isdir(path):
         all_seqs = []
-        exts = (".fasta", ".fa", ".fna", ".fastq", ".fq", ".csv")
+        exts = (".fasta", ".fa", ".fna", ".fastq", ".fq", ".csv", ".gb", ".gbk", ".genbank")
         files = sorted(f for f in os.listdir(path)
                        if any(f.lower().endswith(e) for e in exts))
         if not files:
@@ -97,6 +97,8 @@ def load_sequences(path, seq_col=None, id_col=None):
         return _load_fasta(path)
     elif ext in (".fastq", ".fq"):
         return _load_fastq(path)
+    elif ext in (".gb", ".gbk", ".genbank"):
+        return _load_genbank(path)
     elif ext == ".csv":
         return _load_csv_sequences(path, seq_col=seq_col, id_col=id_col)
     else:
@@ -104,7 +106,7 @@ def load_sequences(path, seq_col=None, id_col=None):
         try:
             return _load_fasta(path)
         except Exception:
-            raise ValueError(f"Cannot determine format for '{path}'. Use .fasta, .fastq, or .csv extension.")
+            raise ValueError(f"Cannot determine format for '{path}'. Use .fasta, .fastq, .gb, or .csv extension.")
 
 
 def _load_fasta(path):
@@ -115,6 +117,21 @@ def _load_fasta(path):
         seq = _clean_sequence(str(record.seq))
         if len(seq) > 0:
             sequences.append((record.id, seq))
+    return sequences
+
+
+def _load_genbank(path):
+    """Load sequences from GenBank (.gb/.gbk) file using BioPython."""
+    from Bio import SeqIO
+    sequences = []
+    for record in SeqIO.parse(path, "genbank"):
+        seq = _clean_sequence(str(record.seq))
+        if len(seq) > 0:
+            # Use accession or locus name as ID
+            sid = record.id if record.id != "<unknown id>" else record.name
+            sequences.append((sid, seq))
+    if sequences:
+        print(f"  GenBank: loaded {len(sequences)} sequences from {path}")
     return sequences
 
 
@@ -192,6 +209,123 @@ def _load_csv_sequences(path, seq_col=None, id_col=None):
             if len(seq) > 0:
                 sequences.append((sid, seq))
     return sequences
+
+
+def load_paired_sequences(r1_path, r2_path, merge="concatenate"):
+    """Load paired-end FASTQ reads and merge R1/R2 pairs.
+
+    Args:
+        r1_path: Path to R1 (forward) FASTQ file.
+        r2_path: Path to R2 (reverse) FASTQ file.
+        merge: How to combine pairs — "concatenate" joins with NNN separator,
+               "r1_only" uses only forward reads, "interleave" alternates.
+
+    Returns: list of (id, sequence) tuples.
+    """
+    from Bio import SeqIO
+
+    r1_records = {r.id: r for r in SeqIO.parse(r1_path, "fastq")}
+    r2_records = {r.id: r for r in SeqIO.parse(r2_path, "fastq")}
+
+    # Match pairs by ID (strip /1 /2 suffixes if present)
+    def _strip_pair_suffix(rid):
+        for suffix in ("/1", "/2", ".1", ".2", " 1", " 2"):
+            if rid.endswith(suffix):
+                return rid[:-len(suffix)]
+        return rid
+
+    r1_by_base = {}
+    for rid, rec in r1_records.items():
+        base = _strip_pair_suffix(rid)
+        r1_by_base[base] = rec
+
+    sequences = []
+    n_paired = 0
+    n_unpaired = 0
+
+    for rid, rec2 in r2_records.items():
+        base = _strip_pair_suffix(rid)
+        if base in r1_by_base:
+            rec1 = r1_by_base[base]
+            s1 = _clean_sequence(str(rec1.seq))
+            s2 = _clean_sequence(str(rec2.seq))
+            n_paired += 1
+
+            if merge == "concatenate":
+                combined = s1 + "NNN" + s2
+                sequences.append((base, combined))
+            elif merge == "r1_only":
+                sequences.append((base, s1))
+            elif merge == "interleave":
+                sequences.append((base + "_R1", s1))
+                sequences.append((base + "_R2", s2))
+            else:
+                sequences.append((base, s1 + "NNN" + s2))
+        else:
+            n_unpaired += 1
+
+    print(f"  Paired-end: {n_paired} pairs matched, {n_unpaired} unpaired")
+    return sequences
+
+
+def compute_sequence_weights(sequences, n_clusters=None):
+    """Weight sequences inversely by cluster frequency for balanced training.
+
+    Uses k-mer frequency vectors + simple clustering to group similar sequences,
+    then weights each sequence inversely by its cluster size.
+
+    Args:
+        sequences: list of (id, sequence) tuples.
+        n_clusters: Number of clusters. Default: sqrt(n_sequences), capped at 100.
+
+    Returns: list of float weights (same length as sequences).
+    """
+    n = len(sequences)
+    if n <= 1:
+        return [1.0] * n
+
+    if n_clusters is None:
+        n_clusters = min(100, max(2, int(n ** 0.5)))
+    n_clusters = min(n_clusters, n)
+
+    # Build 4-mer frequency vectors (256-dim)
+    def _kmer_freq(seq, k=4):
+        counts = {}
+        for i in range(len(seq) - k + 1):
+            kmer = seq[i:i+k]
+            if all(c in "ATCG" for c in kmer):
+                counts[kmer] = counts.get(kmer, 0) + 1
+        total = sum(counts.values()) or 1
+        # Fixed ordering: all 4^k k-mers
+        bases = "ATCG"
+        all_kmers = []
+        def _gen(prefix, depth):
+            if depth == 0:
+                all_kmers.append(prefix)
+                return
+            for b in bases:
+                _gen(prefix + b, depth - 1)
+        _gen("", k)
+        return [counts.get(km, 0) / total for km in all_kmers]
+
+    # Build feature matrix
+    features = np.array([_kmer_freq(seq) for _, seq in sequences])
+
+    # Simple k-means clustering
+    from sklearn.cluster import MiniBatchKMeans
+    kmeans = MiniBatchKMeans(n_clusters=n_clusters, random_state=42, n_init=1, max_iter=50)
+    labels = kmeans.fit_predict(features)
+
+    # Count cluster sizes
+    cluster_sizes = np.bincount(labels, minlength=n_clusters)
+
+    # Weight inversely by cluster size (normalized)
+    weights = [1.0 / max(cluster_sizes[labels[i]], 1) for i in range(n)]
+    total_w = sum(weights)
+    weights = [w * n / total_w for w in weights]  # normalize so mean weight = 1.0
+
+    print(f"  Sequence weighting: {n_clusters} clusters, weight range [{min(weights):.3f}, {max(weights):.3f}]")
+    return weights
 
 
 # ---------------------------------------------------------------------------
@@ -900,6 +1034,91 @@ def make_dataloader(tokens, mask, batch_size, shuffle=True, drop_last=False, lab
         dataset, batch_size=batch_size, shuffle=shuffle, drop_last=drop_last,
         num_workers=num_workers, pin_memory=pin_memory,
         persistent_workers=num_workers > 0,
+    )
+
+
+class StreamingSequenceDataset(torch.utils.data.IterableDataset):
+    """Streaming dataset that reads FASTA/FASTQ on-the-fly for large datasets.
+
+    Tokenizes and chunks sequences lazily, yielding (token_ids, attention_mask) tuples.
+    Supports shuffling via a small buffer (reservoir sampling).
+    """
+
+    def __init__(self, path, tokenizer, max_length, task_type="pretrain",
+                 chunk_overlap=0.5, buffer_size=10000):
+        super().__init__()
+        self.path = path
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+        self.task_type = task_type
+        self.chunk_overlap = chunk_overlap
+        self.buffer_size = buffer_size
+
+    def _tokenize_and_chunk(self, sequence):
+        """Tokenize a sequence and split into fixed-length chunks."""
+        token_ids = self.tokenizer.encode(sequence)
+        if len(token_ids) <= self.max_length - 2:
+            # Fits in one chunk: [CLS] + tokens + [SEP] + padding
+            ids = [CLS_TOKEN_ID] + token_ids + [SEP_TOKEN_ID]
+            pad_len = self.max_length - len(ids)
+            mask = [1] * len(ids) + [0] * pad_len
+            ids = ids + [PAD_TOKEN_ID] * pad_len
+            yield ids, mask
+        else:
+            # Split into overlapping chunks
+            step = max(1, int(self.max_length * (1 - self.chunk_overlap)))
+            usable = self.max_length - 2
+            for start in range(0, len(token_ids) - usable + 1, step):
+                chunk = token_ids[start:start + usable]
+                ids = [CLS_TOKEN_ID] + chunk + [SEP_TOKEN_ID]
+                pad_len = self.max_length - len(ids)
+                mask = [1] * len(ids) + [0] * pad_len
+                ids = ids + [PAD_TOKEN_ID] * pad_len
+                yield ids, mask
+
+    def __iter__(self):
+        from Bio import SeqIO
+        ext = Path(self.path).suffix.lower()
+        fmt = "fastq" if ext in (".fastq", ".fq") else "fasta"
+
+        buffer = []
+        for record in SeqIO.parse(self.path, fmt):
+            seq = _clean_sequence(str(record.seq))
+            if len(seq) == 0:
+                continue
+            for ids, mask in self._tokenize_and_chunk(seq):
+                if len(buffer) < self.buffer_size:
+                    buffer.append((
+                        torch.tensor(ids, dtype=torch.long),
+                        torch.tensor(mask, dtype=torch.long),
+                    ))
+                else:
+                    # Reservoir sampling: replace random element
+                    import random as _rand
+                    idx = _rand.randint(0, len(buffer) - 1)
+                    yield buffer[idx]
+                    buffer[idx] = (
+                        torch.tensor(ids, dtype=torch.long),
+                        torch.tensor(mask, dtype=torch.long),
+                    )
+
+        # Flush remaining buffer (shuffled)
+        import random as _rand
+        _rand.shuffle(buffer)
+        for item in buffer:
+            yield item
+
+
+def make_streaming_dataloader(path, tokenizer, max_length, batch_size,
+                              task_type="pretrain", num_workers=0, pin_memory=False):
+    """Create a streaming DataLoader for large datasets.
+
+    Reads FASTA/FASTQ files lazily — never loads entire dataset into memory.
+    """
+    dataset = StreamingSequenceDataset(path, tokenizer, max_length, task_type)
+    return DataLoader(
+        dataset, batch_size=batch_size,
+        num_workers=num_workers, pin_memory=pin_memory,
     )
 
 
