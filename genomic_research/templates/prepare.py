@@ -1202,7 +1202,8 @@ def generate_report(results, task_type, config, training_history=None,
     if task_type == "pretrain":
         _generate_pretrain_report(results, training_history, report_dir)
     elif task_type == "classify":
-        _generate_classification_report(results, config, target_names, preds, targets, report_dir)
+        probs = results.get("probabilities")
+        _generate_classification_report(results, config, target_names, preds, targets, report_dir, probs)
     elif task_type == "regress":
         _generate_regression_report(results, config, preds, targets, report_dir)
 
@@ -1233,6 +1234,37 @@ def generate_report(results, task_type, config, training_history=None,
             ax.grid(True, alpha=0.3)
             fig.tight_layout()
             fig.savefig(os.path.join(report_dir, "embedding_tsne.png"), dpi=150)
+            plt.close(fig)
+        except (ImportError, Exception):
+            pass
+
+    # --- Embedding PCA visualization ---
+    if embeddings is not None and len(embeddings) > 10:
+        try:
+            from sklearn.decomposition import PCA
+            pca = PCA(n_components=2, random_state=42)
+            coords = pca.fit_transform(embeddings)
+            ev_ratio = pca.explained_variance_ratio_
+
+            fig, ax = plt.subplots(figsize=(8, 8))
+            if embed_labels is not None:
+                unique_labels = np.unique(embed_labels)
+                colors = plt.cm.tab10(np.linspace(0, 1, min(len(unique_labels), 10)))
+                for i, label in enumerate(unique_labels[:10]):
+                    mask = embed_labels == label
+                    lbl = target_names[int(label)] if int(label) < len(target_names) else str(label)
+                    ax.scatter(coords[mask, 0], coords[mask, 1], c=[colors[i % 10]],
+                              label=lbl, alpha=0.6, s=15, edgecolors="none")
+                ax.legend(fontsize=8, markerscale=2)
+            else:
+                ax.scatter(coords[:, 0], coords[:, 1], alpha=0.5, s=15,
+                          color="#2196F3", edgecolors="none")
+            ax.set_title("Embedding PCA")
+            ax.set_xlabel(f"PC1 ({ev_ratio[0]:.1%} var)")
+            ax.set_ylabel(f"PC2 ({ev_ratio[1]:.1%} var)")
+            ax.grid(True, alpha=0.3)
+            fig.tight_layout()
+            fig.savefig(os.path.join(report_dir, "embedding_pca.png"), dpi=150)
             plt.close(fig)
         except (ImportError, Exception):
             pass
@@ -1335,7 +1367,7 @@ def _generate_pretrain_report(results, training_history, report_dir):
     print("\n" + report_text)
 
 
-def _generate_classification_report(results, config, target_names, preds, targets, report_dir):
+def _generate_classification_report(results, config, target_names, preds, targets, report_dir, probs=None):
     """Generate classification-specific plots and text report."""
     import matplotlib
     matplotlib.use("Agg")
@@ -1396,6 +1428,101 @@ def _generate_classification_report(results, config, target_names, preds, target
         fig.tight_layout()
         fig.savefig(os.path.join(report_dir, "per_class_metrics.png"), dpi=150)
         plt.close(fig)
+
+    # ROC Curves (T102)
+    if probs is not None and targets is not None and n_classes >= 2:
+        try:
+            from sklearn.metrics import roc_curve, auc
+            from sklearn.preprocessing import label_binarize
+
+            targets_arr = np.array(targets)
+            probs_arr = np.array(probs)
+
+            if n_classes == 2:
+                # Binary: single ROC curve
+                fpr, tpr, _ = roc_curve(targets_arr, probs_arr[:, 1])
+                roc_auc = auc(fpr, tpr)
+                fig, ax = plt.subplots(figsize=(7, 7))
+                ax.plot(fpr, tpr, color="#2196F3", lw=2, label=f"ROC (AUC = {roc_auc:.3f})")
+                ax.plot([0, 1], [0, 1], "k--", lw=1, alpha=0.5)
+                ax.set_xlabel("False Positive Rate")
+                ax.set_ylabel("True Positive Rate")
+                ax.set_title("ROC Curve")
+                ax.legend(loc="lower right")
+                ax.grid(True, alpha=0.3)
+                fig.tight_layout()
+                fig.savefig(os.path.join(report_dir, "roc_curve.png"), dpi=150)
+                plt.close(fig)
+            else:
+                # Multi-class: one-vs-rest ROC
+                targets_bin = label_binarize(targets_arr, classes=list(range(n_classes)))
+                fig, ax = plt.subplots(figsize=(8, 8))
+                colors = plt.cm.tab10(np.linspace(0, 1, min(n_classes, 10)))
+                for i in range(min(n_classes, 10)):
+                    fpr, tpr, _ = roc_curve(targets_bin[:, i], probs_arr[:, i])
+                    roc_auc_i = auc(fpr, tpr)
+                    lbl = labels[i] if i < len(labels) else str(i)
+                    ax.plot(fpr, tpr, color=colors[i], lw=1.5,
+                            label=f"{lbl} (AUC={roc_auc_i:.2f})")
+                ax.plot([0, 1], [0, 1], "k--", lw=1, alpha=0.5)
+                ax.set_xlabel("False Positive Rate")
+                ax.set_ylabel("True Positive Rate")
+                ax.set_title("ROC Curves (One-vs-Rest)")
+                ax.legend(fontsize=7, loc="lower right")
+                ax.grid(True, alpha=0.3)
+                fig.tight_layout()
+                fig.savefig(os.path.join(report_dir, "roc_curve.png"), dpi=150)
+                plt.close(fig)
+        except (ImportError, Exception):
+            pass
+
+    # PR Curves (T103)
+    if probs is not None and targets is not None and n_classes >= 2:
+        try:
+            from sklearn.metrics import precision_recall_curve, average_precision_score
+            from sklearn.preprocessing import label_binarize
+
+            targets_arr = np.array(targets)
+            probs_arr = np.array(probs)
+
+            if n_classes == 2:
+                precision_vals, recall_vals, _ = precision_recall_curve(targets_arr, probs_arr[:, 1])
+                ap = average_precision_score(targets_arr, probs_arr[:, 1])
+                fig, ax = plt.subplots(figsize=(7, 7))
+                ax.plot(recall_vals, precision_vals, color="#4CAF50", lw=2,
+                        label=f"PR (AP = {ap:.3f})")
+                ax.set_xlabel("Recall")
+                ax.set_ylabel("Precision")
+                ax.set_title("Precision-Recall Curve")
+                ax.legend(loc="lower left")
+                ax.set_xlim(0, 1.05)
+                ax.set_ylim(0, 1.05)
+                ax.grid(True, alpha=0.3)
+                fig.tight_layout()
+                fig.savefig(os.path.join(report_dir, "pr_curve.png"), dpi=150)
+                plt.close(fig)
+            else:
+                targets_bin = label_binarize(targets_arr, classes=list(range(n_classes)))
+                fig, ax = plt.subplots(figsize=(8, 8))
+                colors = plt.cm.tab10(np.linspace(0, 1, min(n_classes, 10)))
+                for i in range(min(n_classes, 10)):
+                    prec_i, rec_i, _ = precision_recall_curve(targets_bin[:, i], probs_arr[:, i])
+                    ap_i = average_precision_score(targets_bin[:, i], probs_arr[:, i])
+                    lbl = labels[i] if i < len(labels) else str(i)
+                    ax.plot(rec_i, prec_i, color=colors[i], lw=1.5,
+                            label=f"{lbl} (AP={ap_i:.2f})")
+                ax.set_xlabel("Recall")
+                ax.set_ylabel("Precision")
+                ax.set_title("Precision-Recall Curves (One-vs-Rest)")
+                ax.legend(fontsize=7, loc="lower left")
+                ax.set_xlim(0, 1.05)
+                ax.set_ylim(0, 1.05)
+                ax.grid(True, alpha=0.3)
+                fig.tight_layout()
+                fig.savefig(os.path.join(report_dir, "pr_curve.png"), dpi=150)
+                plt.close(fig)
+        except (ImportError, Exception):
+            pass
 
     # Text report
     lines = ["Classification Report", "=" * 60]
