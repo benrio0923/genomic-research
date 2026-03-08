@@ -429,6 +429,83 @@ class TestInference:
         shutil.rmtree(cache_dir, ignore_errors=True)
 
 
+class TestChunking:
+    """T23: Test long sequence chunking."""
+
+    def test_chunk_count_and_overlap(self):
+        sys.path.insert(0, str(Path(__file__).parent.parent / "genomic_research" / "templates"))
+        from prepare import _chunk_tokens
+
+        # 100 tokens, max_length 30, 50% overlap -> step=15
+        tokens = list(range(5, 105))  # 100 non-special tokens
+        chunks = _chunk_tokens(tokens, max_length=30, overlap_ratio=0.5, strategy="fixed")
+
+        assert len(chunks) > 1, "Should produce multiple chunks"
+        for chunk in chunks:
+            assert len(chunk) <= 30, f"Chunk exceeds max_length: {len(chunk)}"
+        # First chunk should start from beginning
+        assert chunks[0][:5] == [5, 6, 7, 8, 9]
+
+    def test_short_sequence_no_chunk(self):
+        sys.path.insert(0, str(Path(__file__).parent.parent / "genomic_research" / "templates"))
+        from prepare import _chunk_tokens
+
+        tokens = list(range(5, 25))  # 20 tokens
+        chunks = _chunk_tokens(tokens, max_length=30, overlap_ratio=0.5, strategy="fixed")
+        assert len(chunks) == 1, "Short sequence should not be chunked"
+        assert chunks[0] == tokens
+
+
+class TestReportGeneration:
+    """T26: Test report generation."""
+
+    def test_report_files_created(self, synthetic_fasta):
+        """Verify reports are generated after training."""
+        templates_dir = str(Path(__file__).parent.parent / "genomic_research" / "templates")
+        import shutil
+
+        # Prepare
+        subprocess.run(
+            [sys.executable, os.path.join(templates_dir, "prepare.py"),
+             "--fasta", synthetic_fasta, "--task", "pretrain",
+             "--tokenizer", "char", "--max-length", "64"],
+            capture_output=True, text=True, cwd=templates_dir,
+        )
+
+        # Train
+        env = os.environ.copy()
+        env["GENOMIC_TIME_BUDGET"] = "10"
+        subprocess.run(
+            [sys.executable, os.path.join(templates_dir, "train.py")],
+            capture_output=True, text=True, cwd=templates_dir, env=env, timeout=120,
+        )
+
+        reports_dir = os.path.join(templates_dir, "reports")
+        assert os.path.isdir(reports_dir), "reports/ directory should exist"
+
+        # Check metrics.json
+        metrics_path = os.path.join(reports_dir, "metrics.json")
+        assert os.path.exists(metrics_path), "metrics.json should exist"
+
+        with open(metrics_path) as f:
+            metrics = json.load(f)
+        assert "val_score" in metrics, "metrics.json should contain val_score"
+        assert "val_loss" in metrics, "metrics.json should contain val_loss"
+
+        # Check training curve
+        assert os.path.exists(os.path.join(reports_dir, "training_curve.png")), \
+            "training_curve.png should exist"
+
+        # Clean up
+        shutil.rmtree(reports_dir, ignore_errors=True)
+        shutil.rmtree(os.path.join(templates_dir, "checkpoints"), ignore_errors=True)
+        results_tsv = os.path.join(templates_dir, "results.tsv")
+        if os.path.exists(results_tsv):
+            os.remove(results_tsv)
+        cache_dir = os.path.join(os.path.expanduser("~"), ".cache", "genomic-research")
+        shutil.rmtree(cache_dir, ignore_errors=True)
+
+
 class TestKmerVariants:
     """Test k-mer tokenizer with different k values."""
 
