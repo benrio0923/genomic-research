@@ -138,6 +138,72 @@ class TestPrepareData:
         shutil.rmtree(CACHE_DIR)
 
 
+class TestDataAugmentation:
+    """Test data augmentation utilities."""
+
+    def test_reverse_complement(self):
+        sys.path.insert(0, str(Path(__file__).parent.parent / "genomic_research" / "templates"))
+        import torch
+
+        # Simulate: A=5, T=6, C=7, G=8
+        # RC of ATCG should be CGAT
+        tokens = torch.tensor([[5, 6, 7, 8, 0]], dtype=torch.long)  # ATCG + PAD
+        mask = torch.tensor([[1, 1, 1, 1, 0]], dtype=torch.long)
+
+        from train import reverse_complement_tokens
+        rc = reverse_complement_tokens(tokens, mask)
+        # ATCG -> complement: TAGC -> reverse: CGAT -> tokens: 7,8,5,6
+        assert rc[0, 0].item() == 7  # C
+        assert rc[0, 1].item() == 8  # G
+        assert rc[0, 2].item() == 5  # A
+        assert rc[0, 3].item() == 6  # T
+        assert rc[0, 4].item() == 0  # PAD unchanged
+
+
+class TestModelFactory:
+    """Test model building."""
+
+    def test_build_transformer(self):
+        sys.path.insert(0, str(Path(__file__).parent.parent / "genomic_research" / "templates"))
+        from train import build_model
+        model = build_model("transformer", vocab_size=10, d_model=64, n_heads=4,
+                           d_ff=128, n_layers=2, max_len=64, dropout=0.1,
+                           task_type="pretrain")
+        assert model is not None
+        params = sum(p.numel() for p in model.parameters())
+        assert params > 0
+
+    def test_build_cnn(self):
+        sys.path.insert(0, str(Path(__file__).parent.parent / "genomic_research" / "templates"))
+        from train import build_model
+        model = build_model("cnn", vocab_size=10, d_model=64, n_heads=4,
+                           d_ff=128, n_layers=2, max_len=64, dropout=0.1,
+                           task_type="pretrain")
+        assert model is not None
+
+    def test_build_lstm(self):
+        sys.path.insert(0, str(Path(__file__).parent.parent / "genomic_research" / "templates"))
+        from train import build_model
+        model = build_model("lstm", vocab_size=10, d_model=64, n_heads=4,
+                           d_ff=128, n_layers=2, max_len=64, dropout=0.1,
+                           task_type="pretrain")
+        assert model is not None
+
+    def test_model_forward(self):
+        sys.path.insert(0, str(Path(__file__).parent.parent / "genomic_research" / "templates"))
+        import torch
+        from train import build_model
+        model = build_model("transformer", vocab_size=10, d_model=64, n_heads=4,
+                           d_ff=128, n_layers=2, max_len=64, dropout=0.1,
+                           task_type="pretrain")
+        model.eval()
+        tokens = torch.randint(5, 10, (2, 32))
+        mask = torch.ones(2, 32, dtype=torch.long)
+        with torch.no_grad():
+            out = model(tokens, attention_mask=mask)
+        assert out.shape == (2, 32, 10)  # (batch, seq_len, vocab_size)
+
+
 class TestEndToEnd:
     """End-to-end smoke test: prepare + train."""
 
@@ -174,8 +240,19 @@ class TestEndToEnd:
         assert "val_score" in metrics
         assert "val_perplexity" in metrics
 
+        # Check checkpoint
+        ckpt_dir = os.path.join(templates_dir, "checkpoints")
+        assert os.path.exists(os.path.join(ckpt_dir, "best_model.pt"))
+
+        # Check results.tsv
+        assert os.path.exists(os.path.join(templates_dir, "results.tsv"))
+
         # Clean up
         import shutil
         shutil.rmtree(reports_dir, ignore_errors=True)
+        shutil.rmtree(ckpt_dir, ignore_errors=True)
+        results_tsv = os.path.join(templates_dir, "results.tsv")
+        if os.path.exists(results_tsv):
+            os.remove(results_tsv)
         cache_dir = os.path.join(os.path.expanduser("~"), ".cache", "genomic-research")
         shutil.rmtree(cache_dir, ignore_errors=True)

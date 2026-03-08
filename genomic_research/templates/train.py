@@ -21,31 +21,58 @@ from prepare import (
 )
 
 # ---------------------------------------------------------------------------
+# Optional YAML config override
+# ---------------------------------------------------------------------------
+# Usage: python train.py --config config.yaml
+# Or set GENOMIC_CONFIG=config.yaml environment variable
+# Config file values override the defaults below.
+
+_CONFIG_OVERRIDES = {}
+_config_path = os.environ.get("GENOMIC_CONFIG")
+if not _config_path and len(__import__("sys").argv) > 2 and __import__("sys").argv[1] == "--config":
+    _config_path = __import__("sys").argv[2]
+if _config_path and os.path.exists(_config_path):
+    try:
+        import yaml
+        with open(_config_path) as _f:
+            _CONFIG_OVERRIDES = yaml.safe_load(_f) or {}
+        print(f"Config loaded from {_config_path}")
+    except ImportError:
+        import json
+        with open(_config_path) as _f:
+            _CONFIG_OVERRIDES = json.load(_f)
+        print(f"Config loaded from {_config_path} (JSON)")
+
+def _cfg(key, default):
+    """Get config value with override support."""
+    return _CONFIG_OVERRIDES.get(key, default)
+
+# ---------------------------------------------------------------------------
 # Hyperparameters (edit these — this is what the agent modifies)
 # ---------------------------------------------------------------------------
 
-MODEL_TYPE = "transformer"     # transformer, mamba, cnn, lstm
-D_MODEL = 256                  # model dimension
-N_LAYERS = 6                   # number of layers
-N_HEADS = 8                    # attention heads (transformer only)
-D_FF = 1024                    # feed-forward dimension
-DROPOUT = 0.1                  # dropout rate
-LEARNING_RATE = 1e-4           # learning rate
-WEIGHT_DECAY = 1e-4            # L2 regularization
-BATCH_SIZE = 32                # training batch size
-LR_SCHEDULE = "cosine"         # lr schedule: constant, cosine, step
-WARMUP_RATIO = 0.05            # fraction of training for LR warmup
-OBJECTIVE = "mlm"              # mlm or clm
-MASK_RATIO = 0.15              # fraction of tokens to mask (MLM only)
+MODEL_TYPE = _cfg("model_type", "transformer")     # transformer, mamba, cnn, lstm
+D_MODEL = _cfg("d_model", 256)                     # model dimension
+N_LAYERS = _cfg("n_layers", 6)                     # number of layers
+N_HEADS = _cfg("n_heads", 8)                       # attention heads (transformer only)
+D_FF = _cfg("d_ff", 1024)                          # feed-forward dimension
+DROPOUT = _cfg("dropout", 0.1)                     # dropout rate
+LEARNING_RATE = _cfg("learning_rate", 1e-4)        # learning rate
+WEIGHT_DECAY = _cfg("weight_decay", 1e-4)          # L2 regularization
+BATCH_SIZE = _cfg("batch_size", 32)                # training batch size
+LR_SCHEDULE = _cfg("lr_schedule", "cosine")        # lr schedule: constant, cosine, step
+WARMUP_RATIO = _cfg("warmup_ratio", 0.05)          # fraction of training for LR warmup
+OBJECTIVE = _cfg("objective", "mlm")               # mlm or clm
+MASK_RATIO = _cfg("mask_ratio", 0.15)              # fraction of tokens to mask (MLM only)
 
 # --- Architecture-specific ---
-POS_ENCODING = "sinusoidal"    # sinusoidal, rotary, alibi, learned (transformer)
-KERNEL_SIZES = [7, 7, 7, 7]   # CNN conv kernel sizes per layer
-CNN_CHANNELS = 256             # CNN intermediate channels
-LSTM_BIDIRECTIONAL = True      # LSTM bidirectional
-MAMBA_D_STATE = 16             # Mamba state dimension
-MAMBA_D_CONV = 4               # Mamba conv dimension
-MAMBA_EXPAND = 2               # Mamba expansion factor
+POS_ENCODING = _cfg("pos_encoding", "sinusoidal")  # sinusoidal, rotary, alibi, learned
+KERNEL_SIZES = _cfg("kernel_sizes", [7, 7, 7, 7])  # CNN conv kernel sizes per layer
+CNN_CHANNELS = _cfg("cnn_channels", 256)            # CNN intermediate channels
+LSTM_BIDIRECTIONAL = _cfg("lstm_bidirectional", True)
+MAMBA_D_STATE = _cfg("mamba_d_state", 16)
+MAMBA_D_CONV = _cfg("mamba_d_conv", 4)
+MAMBA_EXPAND = _cfg("mamba_expand", 2)
 
 # --- Data augmentation ---
 USE_RC_AUGMENT = False         # reverse complement augmentation (50% chance)
@@ -717,7 +744,11 @@ optimizer = torch.optim.AdamW(
 if task_type == "pretrain":
     criterion = nn.CrossEntropyLoss(ignore_index=PAD_TOKEN_ID)
 elif task_type == "classify":
-    criterion = nn.CrossEntropyLoss()
+    class_weights = config.get("class_weights")
+    if class_weights:
+        criterion = nn.CrossEntropyLoss(weight=torch.tensor(class_weights, dtype=torch.float32, device=device))
+    else:
+        criterion = nn.CrossEntropyLoss()
 else:
     criterion = nn.MSELoss()
 
@@ -801,75 +832,85 @@ while True:
     for batch in train_loader:
         t0 = time.time()
 
-        if task_type in ("classify", "regress"):
-            tokens_batch, mask_batch, labels_batch = batch
-            tokens_batch = tokens_batch.to(device)
-            mask_batch = mask_batch.to(device)
-            labels_batch = labels_batch.to(device)
-
-            with torch.amp.autocast(device.type, enabled=amp_enabled, dtype=amp_dtype):
-                output = model(tokens_batch, attention_mask=mask_batch)
-                if task_type == "regress":
-                    output = output.squeeze(-1)
-                loss = criterion(output, labels_batch)
-
-        else:  # pretrain
-            tokens_batch, mask_batch = batch
-            tokens_batch = tokens_batch.to(device)
-            mask_batch = mask_batch.to(device)
-
-            # Reverse complement augmentation (50% chance per batch)
-            if USE_RC_AUGMENT and torch.rand(1).item() < 0.5:
-                tokens_batch = reverse_complement_tokens(tokens_batch, mask_batch)
-
-            if OBJECTIVE == "mlm":
-                if USE_SPAN_MASKING:
-                    input_ids, labels = span_mask_tokens(
-                        tokens_batch, mask_batch, MASK_RATIO, SPAN_MEAN_LENGTH,
-                        MASK_TOKEN_ID, NUM_SPECIAL,
-                    )
-                else:
-                    input_ids = tokens_batch.clone()
-                    labels = tokens_batch.clone()
-                    mask_candidates = (mask_batch == 1) & (tokens_batch >= NUM_SPECIAL)
-                    rand = torch.rand_like(tokens_batch.float())
-                    mask_positions = mask_candidates & (rand < MASK_RATIO)
-                    input_ids[mask_positions] = MASK_TOKEN_ID
-                    labels[~mask_positions] = PAD_TOKEN_ID
+        try:
+            if task_type in ("classify", "regress"):
+                tokens_batch, mask_batch, labels_batch = batch
+                tokens_batch = tokens_batch.to(device)
+                mask_batch = mask_batch.to(device)
+                labels_batch = labels_batch.to(device)
 
                 with torch.amp.autocast(device.type, enabled=amp_enabled, dtype=amp_dtype):
-                    logits = model(input_ids, attention_mask=mask_batch)
-                    loss = criterion(logits.reshape(-1, vocab_size), labels.reshape(-1))
+                    output = model(tokens_batch, attention_mask=mask_batch)
+                    if task_type == "regress":
+                        output = output.squeeze(-1)
+                    loss = criterion(output, labels_batch)
 
-            else:  # CLM
-                input_ids = tokens_batch[:, :-1]
-                target_ids = tokens_batch[:, 1:]
-                input_mask = mask_batch[:, :-1]
+            else:  # pretrain
+                tokens_batch, mask_batch = batch
+                tokens_batch = tokens_batch.to(device)
+                mask_batch = mask_batch.to(device)
 
-                with torch.amp.autocast(device.type, enabled=amp_enabled, dtype=amp_dtype):
-                    logits = model(input_ids, attention_mask=input_mask)
-                    loss = criterion(logits.reshape(-1, vocab_size), target_ids.reshape(-1))
+                # Reverse complement augmentation (50% chance per batch)
+                if USE_RC_AUGMENT and torch.rand(1).item() < 0.5:
+                    tokens_batch = reverse_complement_tokens(tokens_batch, mask_batch)
 
-        # Scale loss for gradient accumulation
-        loss = loss / GRAD_ACCUM_STEPS
+                if OBJECTIVE == "mlm":
+                    if USE_SPAN_MASKING:
+                        input_ids, labels = span_mask_tokens(
+                            tokens_batch, mask_batch, MASK_RATIO, SPAN_MEAN_LENGTH,
+                            MASK_TOKEN_ID, NUM_SPECIAL,
+                        )
+                    else:
+                        input_ids = tokens_batch.clone()
+                        labels = tokens_batch.clone()
+                        mask_candidates = (mask_batch == 1) & (tokens_batch >= NUM_SPECIAL)
+                        rand = torch.rand_like(tokens_batch.float())
+                        mask_positions = mask_candidates & (rand < MASK_RATIO)
+                        input_ids[mask_positions] = MASK_TOKEN_ID
+                        labels[~mask_positions] = PAD_TOKEN_ID
 
-        # Backward with AMP
-        if scaler is not None:
-            scaler.scale(loss).backward()
-        else:
-            loss.backward()
+                    with torch.amp.autocast(device.type, enabled=amp_enabled, dtype=amp_dtype):
+                        logits = model(input_ids, attention_mask=mask_batch)
+                        loss = criterion(logits.reshape(-1, vocab_size), labels.reshape(-1))
 
-        # Optimizer step every GRAD_ACCUM_STEPS
-        if (step + 1) % GRAD_ACCUM_STEPS == 0 or step < 5:
+                else:  # CLM
+                    input_ids = tokens_batch[:, :-1]
+                    target_ids = tokens_batch[:, 1:]
+                    input_mask = mask_batch[:, :-1]
+
+                    with torch.amp.autocast(device.type, enabled=amp_enabled, dtype=amp_dtype):
+                        logits = model(input_ids, attention_mask=input_mask)
+                        loss = criterion(logits.reshape(-1, vocab_size), target_ids.reshape(-1))
+
+            # Scale loss for gradient accumulation
+            loss = loss / GRAD_ACCUM_STEPS
+
+            # Backward with AMP
             if scaler is not None:
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                scaler.step(optimizer)
-                scaler.update()
+                scaler.scale(loss).backward()
             else:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                optimizer.step()
-            optimizer.zero_grad()
+                loss.backward()
+
+            # Optimizer step every GRAD_ACCUM_STEPS
+            if (step + 1) % GRAD_ACCUM_STEPS == 0 or step < 5:
+                if scaler is not None:
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                    optimizer.step()
+                optimizer.zero_grad()
+
+        except RuntimeError as e:
+            if "out of memory" in str(e).lower():
+                print(f"\n[OOM] CUDA out of memory at step {step}. Clearing cache and skipping batch.")
+                if device.type == "cuda":
+                    torch.cuda.empty_cache()
+                optimizer.zero_grad()
+                continue
+            raise
 
         # Update LR
         elapsed_fraction = total_training_time / TIME_BUDGET if TIME_BUDGET > 0 else 1.0
@@ -1145,3 +1186,26 @@ with open(results_file, "a", newline="") as f:
     writer.writerow(row)
 
 print(f"Results logged to {results_file}")
+
+# ---------------------------------------------------------------------------
+# Optional: ONNX export
+# ---------------------------------------------------------------------------
+
+if os.environ.get("GENOMIC_EXPORT_ONNX"):
+    try:
+        onnx_path = os.environ.get("GENOMIC_EXPORT_ONNX", "model.onnx")
+        dummy_input = torch.randint(5, vocab_size, (1, max_length), device=device)
+        dummy_mask = torch.ones(1, max_length, dtype=torch.long, device=device)
+        # Unwrap DDP if needed
+        export_model = model.module if hasattr(model, 'module') else model
+        export_model.eval()
+        torch.onnx.export(
+            export_model, (dummy_input, dummy_mask), onnx_path,
+            input_names=["input_ids", "attention_mask"],
+            output_names=["logits"],
+            dynamic_axes={"input_ids": {0: "batch", 1: "seq"}, "attention_mask": {0: "batch", 1: "seq"}},
+            opset_version=14,
+        )
+        print(f"ONNX model exported to {onnx_path}")
+    except Exception as e:
+        print(f"ONNX export failed: {e}")
