@@ -10,8 +10,11 @@ Usage: python train.py
 
 import math
 import os
+import random
 import signal
 import time
+
+import numpy as np
 
 import torch
 import torch.nn as nn
@@ -626,13 +629,15 @@ class GenomicMamba(nn.Module):
 # ---------------------------------------------------------------------------
 
 def build_model(model_type, vocab_size, d_model, n_heads, d_ff, n_layers,
-                max_len, dropout, task_type, n_classes=None):
+                max_len, dropout, task_type, n_classes=None,
+                pos_encoding=None, **kwargs):
     """Build model based on MODEL_TYPE."""
     if model_type == "transformer":
+        pe = pos_encoding or POS_ENCODING
         return GenomicTransformer(
             vocab_size=vocab_size, d_model=d_model, n_heads=n_heads, d_ff=d_ff,
             n_layers=n_layers, max_len=max_len, dropout=dropout,
-            task_type=task_type, n_classes=n_classes, pos_encoding=POS_ENCODING,
+            task_type=task_type, n_classes=n_classes, pos_encoding=pe,
         )
     elif model_type == "cnn":
         return GenomicCNN(
@@ -657,579 +662,581 @@ def build_model(model_type, vocab_size, d_model, n_heads, d_ff, n_layers,
         raise ValueError(f"Unknown model type: {model_type}. Use: transformer, cnn, lstm, mamba")
 
 
+
 # ---------------------------------------------------------------------------
-# Setup
+# Main execution
 # ---------------------------------------------------------------------------
 
-t_start = time.time()
+if __name__ == "__main__":
 
-# Seed everything for reproducibility
-import random
-import numpy as np
-random.seed(SEED)
-np.random.seed(SEED)
-torch.manual_seed(SEED)
-if torch.cuda.is_available():
-    torch.cuda.manual_seed_all(SEED)
 
-# DDP setup
-_ddp_rank = 0
-_ddp_world_size = 1
-_is_main_process = True
+    t_start = time.time()
 
-if USE_DDP and torch.cuda.is_available() and torch.cuda.device_count() > 1:
-    import torch.distributed as dist
-    from torch.nn.parallel import DistributedDataParallel as DDP
-    from torch.utils.data.distributed import DistributedSampler
+    # Seed everything for reproducibility
+    random.seed(SEED)
+    np.random.seed(SEED)
+    torch.manual_seed(SEED)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(SEED)
 
-    if not dist.is_initialized():
-        dist.init_process_group(backend="nccl")
-    _ddp_rank = dist.get_rank()
-    _ddp_world_size = dist.get_world_size()
-    _is_main_process = _ddp_rank == 0
-    device = torch.device(f"cuda:{_ddp_rank}")
-    torch.cuda.set_device(device)
+    # DDP setup
+    _ddp_rank = 0
+    _ddp_world_size = 1
+    _is_main_process = True
+
+    if USE_DDP and torch.cuda.is_available() and torch.cuda.device_count() > 1:
+        import torch.distributed as dist
+        from torch.nn.parallel import DistributedDataParallel as DDP
+        from torch.utils.data.distributed import DistributedSampler
+
+        if not dist.is_initialized():
+            dist.init_process_group(backend="nccl")
+        _ddp_rank = dist.get_rank()
+        _ddp_world_size = dist.get_world_size()
+        _is_main_process = _ddp_rank == 0
+        device = torch.device(f"cuda:{_ddp_rank}")
+        torch.cuda.set_device(device)
+        if _is_main_process:
+            print(f"DDP: {_ddp_world_size} GPUs")
+    elif torch.cuda.is_available():
+        device = torch.device("cuda")
+    elif torch.backends.mps.is_available():
+        device = torch.device("mps")
+    else:
+        device = torch.device("cpu")
+
     if _is_main_process:
-        print(f"DDP: {_ddp_world_size} GPUs")
-elif torch.cuda.is_available():
-    device = torch.device("cuda")
-elif torch.backends.mps.is_available():
-    device = torch.device("mps")
-else:
-    device = torch.device("cpu")
+        print(f"Device: {device}")
 
-if _is_main_process:
-    print(f"Device: {device}")
+    config = load_config()
+    task_type = config["task_type"]
+    vocab_size = config["vocab_size"]
+    max_length = config["max_length"]
+    print(f"Task: {task_type} | Vocab: {vocab_size} | Max length: {max_length}")
+    print(f"Train: {config['n_train']} | Val: {config['n_val']}")
 
-config = load_config()
-task_type = config["task_type"]
-vocab_size = config["vocab_size"]
-max_length = config["max_length"]
-print(f"Task: {task_type} | Vocab: {vocab_size} | Max length: {max_length}")
-print(f"Train: {config['n_train']} | Val: {config['n_val']}")
+    data = load_data(device=device)
 
-data = load_data(device=device)
+    # Build model
+    n_classes = config.get("n_classes")
+    model = build_model(
+        model_type=MODEL_TYPE,
+        vocab_size=vocab_size,
+        d_model=D_MODEL,
+        n_heads=N_HEADS,
+        d_ff=D_FF,
+        n_layers=N_LAYERS,
+        max_len=max_length,
+        dropout=DROPOUT,
+        task_type=task_type,
+        n_classes=n_classes,
+    ).to(device)
 
-# Build model
-n_classes = config.get("n_classes")
-model = build_model(
-    model_type=MODEL_TYPE,
-    vocab_size=vocab_size,
-    d_model=D_MODEL,
-    n_heads=N_HEADS,
-    d_ff=D_FF,
-    n_layers=N_LAYERS,
-    max_len=max_length,
-    dropout=DROPOUT,
-    task_type=task_type,
-    n_classes=n_classes,
-).to(device)
+    if OBJECTIVE == "clm":
+        model._use_causal = True
 
-if OBJECTIVE == "clm":
-    model._use_causal = True
+    # Wrap with DDP
+    if USE_DDP and _ddp_world_size > 1:
+        model = DDP(model, device_ids=[_ddp_rank])
 
-# Wrap with DDP
-if USE_DDP and _ddp_world_size > 1:
-    model = DDP(model, device_ids=[_ddp_rank])
+    # Gradient checkpointing
+    if USE_GRAD_CHECKPOINT and hasattr(model, 'encoder'):
+        model.encoder.enable_nested_tensor = False
+        for layer in model.encoder.layers:
+            layer._sa_block = torch.utils.checkpoint.checkpoint_sequential.__class__  # marker
+        # Use torch checkpoint wrapper
+        _orig_encoder_forward = model.encoder.forward
+        def _ckpt_encoder_forward(src, **kwargs):
+            for mod in model.encoder.layers:
+                src = torch.utils.checkpoint.checkpoint(mod, src, use_reentrant=False, **{k: v for k, v in kwargs.items() if k != 'src'}) if src.requires_grad else mod(src, **{k: v for k, v in kwargs.items() if k != 'src'})
+            return src
+        # Simpler approach: just set flag
+        print("Gradient checkpointing: enabled")
 
-# Gradient checkpointing
-if USE_GRAD_CHECKPOINT and hasattr(model, 'encoder'):
-    model.encoder.enable_nested_tensor = False
-    for layer in model.encoder.layers:
-        layer._sa_block = torch.utils.checkpoint.checkpoint_sequential.__class__  # marker
-    # Use torch checkpoint wrapper
-    _orig_encoder_forward = model.encoder.forward
-    def _ckpt_encoder_forward(src, **kwargs):
-        for mod in model.encoder.layers:
-            src = torch.utils.checkpoint.checkpoint(mod, src, use_reentrant=False, **{k: v for k, v in kwargs.items() if k != 'src'}) if src.requires_grad else mod(src, **{k: v for k, v in kwargs.items() if k != 'src'})
-        return src
-    # Simpler approach: just set flag
-    print("Gradient checkpointing: enabled")
+    # Mixed precision setup
+    amp_enabled = USE_AMP and device.type == "cuda"
+    amp_dtype = torch.float16 if amp_enabled else torch.float32
+    amp_device = device.type if amp_enabled else "cpu"  # avoid MPS autocast warnings
+    scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled) if amp_enabled else None
+    if amp_enabled:
+        print("Mixed precision: fp16 (CUDA AMP)")
 
-# Mixed precision setup
-amp_enabled = USE_AMP and device.type == "cuda"
-amp_dtype = torch.float16 if amp_enabled else torch.float32
-amp_device = device.type if amp_enabled else "cpu"  # avoid MPS autocast warnings
-scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled) if amp_enabled else None
-if amp_enabled:
-    print("Mixed precision: fp16 (CUDA AMP)")
+    num_params = sum(p.numel() for p in model.parameters())
+    print(f"Parameters: {num_params:,}")
 
-num_params = sum(p.numel() for p in model.parameters())
-print(f"Parameters: {num_params:,}")
-
-# Optimizer
-optimizer = torch.optim.AdamW(
-    model.parameters(),
-    lr=LEARNING_RATE,
-    weight_decay=WEIGHT_DECAY,
-)
-
-# Loss function
-if task_type == "pretrain":
-    criterion = nn.CrossEntropyLoss(ignore_index=PAD_TOKEN_ID)
-elif task_type == "classify":
-    class_weights = config.get("class_weights")
-    if class_weights:
-        criterion = nn.CrossEntropyLoss(weight=torch.tensor(class_weights, dtype=torch.float32, device=device))
-    else:
-        criterion = nn.CrossEntropyLoss()
-else:
-    criterion = nn.MSELoss()
-
-# DataLoader
-actual_batch_size = min(BATCH_SIZE, config["n_train"] // 2) if config["n_train"] > 1 else 1
-use_drop_last = config["n_train"] > actual_batch_size
-
-_pin = PIN_MEMORY and device.type == "cuda"
-if task_type in ("classify", "regress"):
-    train_loader = make_dataloader(
-        data["train_tokens"], data["train_mask"], actual_batch_size,
-        shuffle=True, drop_last=use_drop_last, labels=data.get("train_labels"),
-        num_workers=NUM_WORKERS, pin_memory=_pin,
-    )
-else:
-    train_loader = make_dataloader(
-        data["train_tokens"], data["train_mask"], actual_batch_size,
-        shuffle=True, drop_last=use_drop_last,
-        num_workers=NUM_WORKERS, pin_memory=_pin,
+    # Optimizer
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=LEARNING_RATE,
+        weight_decay=WEIGHT_DECAY,
     )
 
-print(f"Time budget: {TIME_BUDGET}s")
-print(f"Batch size: {actual_batch_size}")
-print(f"Model: {MODEL_TYPE} | d_model={D_MODEL} | layers={N_LAYERS} | heads={N_HEADS}")
-print(f"Objective: {OBJECTIVE} | Mask ratio: {MASK_RATIO}")
-print(f"LR: {LEARNING_RATE} | Weight decay: {WEIGHT_DECAY} | Schedule: {LR_SCHEDULE}")
-if GRAD_ACCUM_STEPS > 1:
-    print(f"Grad accumulation: {GRAD_ACCUM_STEPS} steps (effective batch={actual_batch_size * GRAD_ACCUM_STEPS})")
-
-# ---------------------------------------------------------------------------
-# LR Schedule
-# ---------------------------------------------------------------------------
-
-def get_lr(elapsed_fraction):
-    """Compute learning rate based on time-based progress."""
-    progress = min(elapsed_fraction, 1.0)
-
-    if progress < WARMUP_RATIO:
-        warmup_factor = progress / WARMUP_RATIO if WARMUP_RATIO > 0 else 1.0
-        return LEARNING_RATE * warmup_factor
-
-    adjusted_progress = (progress - WARMUP_RATIO) / (1.0 - WARMUP_RATIO)
-
-    if LR_SCHEDULE == "cosine":
-        return LEARNING_RATE * 0.5 * (1 + math.cos(math.pi * adjusted_progress))
-    elif LR_SCHEDULE == "step":
-        if adjusted_progress > 0.7:
-            return LEARNING_RATE * 0.01
-        elif adjusted_progress > 0.4:
-            return LEARNING_RATE * 0.1
-        return LEARNING_RATE
+    # Loss function
+    if task_type == "pretrain":
+        criterion = nn.CrossEntropyLoss(ignore_index=PAD_TOKEN_ID)
+    elif task_type == "classify":
+        class_weights = config.get("class_weights")
+        if class_weights:
+            criterion = nn.CrossEntropyLoss(weight=torch.tensor(class_weights, dtype=torch.float32, device=device))
+        else:
+            criterion = nn.CrossEntropyLoss()
     else:
-        return LEARNING_RATE
+        criterion = nn.MSELoss()
+
+    # DataLoader
+    actual_batch_size = min(BATCH_SIZE, config["n_train"] // 2) if config["n_train"] > 1 else 1
+    use_drop_last = config["n_train"] > actual_batch_size
+
+    _pin = PIN_MEMORY and device.type == "cuda"
+    if task_type in ("classify", "regress"):
+        train_loader = make_dataloader(
+            data["train_tokens"], data["train_mask"], actual_batch_size,
+            shuffle=True, drop_last=use_drop_last, labels=data.get("train_labels"),
+            num_workers=NUM_WORKERS, pin_memory=_pin,
+        )
+    else:
+        train_loader = make_dataloader(
+            data["train_tokens"], data["train_mask"], actual_batch_size,
+            shuffle=True, drop_last=use_drop_last,
+            num_workers=NUM_WORKERS, pin_memory=_pin,
+        )
+
+    print(f"Time budget: {TIME_BUDGET}s")
+    print(f"Batch size: {actual_batch_size}")
+    print(f"Model: {MODEL_TYPE} | d_model={D_MODEL} | layers={N_LAYERS} | heads={N_HEADS}")
+    print(f"Objective: {OBJECTIVE} | Mask ratio: {MASK_RATIO}")
+    print(f"LR: {LEARNING_RATE} | Weight decay: {WEIGHT_DECAY} | Schedule: {LR_SCHEDULE}")
+    if GRAD_ACCUM_STEPS > 1:
+        print(f"Grad accumulation: {GRAD_ACCUM_STEPS} steps (effective batch={actual_batch_size * GRAD_ACCUM_STEPS})")
+
+    # ---------------------------------------------------------------------------
+    # LR Schedule
+    # ---------------------------------------------------------------------------
+
+    def get_lr(elapsed_fraction):
+        """Compute learning rate based on time-based progress."""
+        progress = min(elapsed_fraction, 1.0)
+
+        if progress < WARMUP_RATIO:
+            warmup_factor = progress / WARMUP_RATIO if WARMUP_RATIO > 0 else 1.0
+            return LEARNING_RATE * warmup_factor
+
+        adjusted_progress = (progress - WARMUP_RATIO) / (1.0 - WARMUP_RATIO)
+
+        if LR_SCHEDULE == "cosine":
+            return LEARNING_RATE * 0.5 * (1 + math.cos(math.pi * adjusted_progress))
+        elif LR_SCHEDULE == "step":
+            if adjusted_progress > 0.7:
+                return LEARNING_RATE * 0.01
+            elif adjusted_progress > 0.4:
+                return LEARNING_RATE * 0.1
+            return LEARNING_RATE
+        else:
+            return LEARNING_RATE
 
 
-# ---------------------------------------------------------------------------
-# Training loop
-# ---------------------------------------------------------------------------
+    # ---------------------------------------------------------------------------
+    # Training loop
+    # ---------------------------------------------------------------------------
 
-t_start_training = time.time()
-total_training_time = 0.0
-step = 0
-epoch = 0
-smooth_train_loss = 0.0
-best_val_score = None
-best_state_dict = None
+    t_start_training = time.time()
+    total_training_time = 0.0
+    step = 0
+    epoch = 0
+    smooth_train_loss = 0.0
+    best_val_score = None
+    best_state_dict = None
 
-history = {
-    "steps": [], "losses": [], "lrs": [],
-    "eval_steps": [], "eval_scores": [],
-    "eval_perplexities": [], "eval_token_accuracies": [],
-}
+    history = {
+        "steps": [], "losses": [], "lrs": [],
+        "eval_steps": [], "eval_scores": [],
+        "eval_perplexities": [], "eval_token_accuracies": [],
+    }
 
-eval_interval_seconds = max(TIME_BUDGET * 0.2, 10)
-last_eval_time = 0.0
+    eval_interval_seconds = max(TIME_BUDGET * 0.2, 10)
+    last_eval_time = 0.0
 
-model.train()
+    model.train()
 
-while True:
-    epoch += 1
-    for batch in train_loader:
-        t0 = time.time()
+    while True:
+        epoch += 1
+        for batch in train_loader:
+            t0 = time.time()
 
-        try:
-            if task_type in ("classify", "regress"):
-                tokens_batch, mask_batch, labels_batch = batch
-                tokens_batch = tokens_batch.to(device)
-                mask_batch = mask_batch.to(device)
-                labels_batch = labels_batch.to(device)
-
-                with torch.amp.autocast(amp_device, enabled=amp_enabled, dtype=amp_dtype):
-                    output = model(tokens_batch, attention_mask=mask_batch)
-                    if task_type == "regress":
-                        output = output.squeeze(-1)
-                    loss = criterion(output, labels_batch)
-
-            else:  # pretrain
-                tokens_batch, mask_batch = batch
-                tokens_batch = tokens_batch.to(device)
-                mask_batch = mask_batch.to(device)
-
-                # Reverse complement augmentation (50% chance per batch)
-                if USE_RC_AUGMENT and torch.rand(1).item() < 0.5:
-                    tokens_batch = reverse_complement_tokens(tokens_batch, mask_batch)
-
-                if OBJECTIVE == "mlm":
-                    if USE_SPAN_MASKING:
-                        input_ids, labels = span_mask_tokens(
-                            tokens_batch, mask_batch, MASK_RATIO, SPAN_MEAN_LENGTH,
-                            MASK_TOKEN_ID, NUM_SPECIAL,
-                        )
-                    else:
-                        input_ids = tokens_batch.clone()
-                        labels = tokens_batch.clone()
-                        mask_candidates = (mask_batch == 1) & (tokens_batch >= NUM_SPECIAL)
-                        rand = torch.rand_like(tokens_batch.float())
-                        mask_positions = mask_candidates & (rand < MASK_RATIO)
-                        input_ids[mask_positions] = MASK_TOKEN_ID
-                        labels[~mask_positions] = PAD_TOKEN_ID
+            try:
+                if task_type in ("classify", "regress"):
+                    tokens_batch, mask_batch, labels_batch = batch
+                    tokens_batch = tokens_batch.to(device)
+                    mask_batch = mask_batch.to(device)
+                    labels_batch = labels_batch.to(device)
 
                     with torch.amp.autocast(amp_device, enabled=amp_enabled, dtype=amp_dtype):
-                        logits = model(input_ids, attention_mask=mask_batch)
-                        loss = criterion(logits.reshape(-1, vocab_size), labels.reshape(-1))
+                        output = model(tokens_batch, attention_mask=mask_batch)
+                        if task_type == "regress":
+                            output = output.squeeze(-1)
+                        loss = criterion(output, labels_batch)
 
-                else:  # CLM
-                    input_ids = tokens_batch[:, :-1]
-                    target_ids = tokens_batch[:, 1:]
-                    input_mask = mask_batch[:, :-1]
+                else:  # pretrain
+                    tokens_batch, mask_batch = batch
+                    tokens_batch = tokens_batch.to(device)
+                    mask_batch = mask_batch.to(device)
 
-                    with torch.amp.autocast(amp_device, enabled=amp_enabled, dtype=amp_dtype):
-                        logits = model(input_ids, attention_mask=input_mask)
-                        loss = criterion(logits.reshape(-1, vocab_size), target_ids.reshape(-1))
+                    # Reverse complement augmentation (50% chance per batch)
+                    if USE_RC_AUGMENT and torch.rand(1).item() < 0.5:
+                        tokens_batch = reverse_complement_tokens(tokens_batch, mask_batch)
 
-            # Scale loss for gradient accumulation
-            loss = loss / GRAD_ACCUM_STEPS
+                    if OBJECTIVE == "mlm":
+                        if USE_SPAN_MASKING:
+                            input_ids, labels = span_mask_tokens(
+                                tokens_batch, mask_batch, MASK_RATIO, SPAN_MEAN_LENGTH,
+                                MASK_TOKEN_ID, NUM_SPECIAL,
+                            )
+                        else:
+                            input_ids = tokens_batch.clone()
+                            labels = tokens_batch.clone()
+                            mask_candidates = (mask_batch == 1) & (tokens_batch >= NUM_SPECIAL)
+                            rand = torch.rand_like(tokens_batch.float())
+                            mask_positions = mask_candidates & (rand < MASK_RATIO)
+                            input_ids[mask_positions] = MASK_TOKEN_ID
+                            labels[~mask_positions] = PAD_TOKEN_ID
 
-            # Backward with AMP
-            if scaler is not None:
-                scaler.scale(loss).backward()
-            else:
-                loss.backward()
+                        with torch.amp.autocast(amp_device, enabled=amp_enabled, dtype=amp_dtype):
+                            logits = model(input_ids, attention_mask=mask_batch)
+                            loss = criterion(logits.reshape(-1, vocab_size), labels.reshape(-1))
 
-            # Optimizer step every GRAD_ACCUM_STEPS
-            if (step + 1) % GRAD_ACCUM_STEPS == 0 or step < 5:
+                    else:  # CLM
+                        input_ids = tokens_batch[:, :-1]
+                        target_ids = tokens_batch[:, 1:]
+                        input_mask = mask_batch[:, :-1]
+
+                        with torch.amp.autocast(amp_device, enabled=amp_enabled, dtype=amp_dtype):
+                            logits = model(input_ids, attention_mask=input_mask)
+                            loss = criterion(logits.reshape(-1, vocab_size), target_ids.reshape(-1))
+
+                # Scale loss for gradient accumulation
+                loss = loss / GRAD_ACCUM_STEPS
+
+                # Backward with AMP
                 if scaler is not None:
-                    scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                    scaler.step(optimizer)
-                    scaler.update()
+                    scaler.scale(loss).backward()
                 else:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                    optimizer.step()
-                optimizer.zero_grad()
+                    loss.backward()
 
-        except RuntimeError as e:
-            if "out of memory" in str(e).lower():
-                print(f"\n[OOM] CUDA out of memory at step {step}. Clearing cache and skipping batch.")
-                if device.type == "cuda":
-                    torch.cuda.empty_cache()
-                optimizer.zero_grad()
-                continue
-            raise
+                # Optimizer step every GRAD_ACCUM_STEPS
+                if (step + 1) % GRAD_ACCUM_STEPS == 0 or step < 5:
+                    if scaler is not None:
+                        scaler.unscale_(optimizer)
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                        scaler.step(optimizer)
+                        scaler.update()
+                    else:
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                        optimizer.step()
+                    optimizer.zero_grad()
 
-        # Update LR
-        elapsed_fraction = total_training_time / TIME_BUDGET if TIME_BUDGET > 0 else 1.0
-        lr = get_lr(elapsed_fraction)
-        for param_group in optimizer.param_groups:
-            param_group["lr"] = lr
+            except RuntimeError as e:
+                if "out of memory" in str(e).lower():
+                    print(f"\n[OOM] CUDA out of memory at step {step}. Clearing cache and skipping batch.")
+                    if device.type == "cuda":
+                        torch.cuda.empty_cache()
+                    optimizer.zero_grad()
+                    continue
+                raise
 
-        t1 = time.time()
-        dt = t1 - t0
+            # Update LR
+            elapsed_fraction = total_training_time / TIME_BUDGET if TIME_BUDGET > 0 else 1.0
+            lr = get_lr(elapsed_fraction)
+            for param_group in optimizer.param_groups:
+                param_group["lr"] = lr
 
-        if step > 5:
-            total_training_time += dt
+            t1 = time.time()
+            dt = t1 - t0
 
-        # Logging (undo accumulation scaling for display)
-        train_loss_f = loss.item() * GRAD_ACCUM_STEPS
-        ema_beta = 0.9
-        smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss_f
-        debiased_smooth_loss = smooth_train_loss / (1 - ema_beta ** (step + 1))
-        pct_done = 100 * min(total_training_time / TIME_BUDGET, 1.0)
-        remaining = max(0, TIME_BUDGET - total_training_time)
+            if step > 5:
+                total_training_time += dt
 
-        if step % 50 == 0:
-            history["steps"].append(step)
-            history["losses"].append(debiased_smooth_loss)
-            history["lrs"].append(lr)
-            print(f"\rstep {step:05d} ({pct_done:.1f}%) | loss: {debiased_smooth_loss:.6f} | lr: {lr:.2e} | epoch: {epoch} | remaining: {remaining:.0f}s    ", end="", flush=True)
+            # Logging (undo accumulation scaling for display)
+            train_loss_f = loss.item() * GRAD_ACCUM_STEPS
+            ema_beta = 0.9
+            smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss_f
+            debiased_smooth_loss = smooth_train_loss / (1 - ema_beta ** (step + 1))
+            pct_done = 100 * min(total_training_time / TIME_BUDGET, 1.0)
+            remaining = max(0, TIME_BUDGET - total_training_time)
 
-        # Periodic evaluation
-        if step > 5 and total_training_time - last_eval_time >= eval_interval_seconds:
-            model.eval()
-            eval_results = evaluate(
-                model, data, task_type, config,
-                objective=OBJECTIVE, batch_size=actual_batch_size * 2,
-                device=device, mask_ratio=MASK_RATIO,
-            )
-            history["eval_steps"].append(step)
-            history["eval_scores"].append(eval_results["val_score"])
+            if step % 50 == 0:
+                history["steps"].append(step)
+                history["losses"].append(debiased_smooth_loss)
+                history["lrs"].append(lr)
+                print(f"\rstep {step:05d} ({pct_done:.1f}%) | loss: {debiased_smooth_loss:.6f} | lr: {lr:.2e} | epoch: {epoch} | remaining: {remaining:.0f}s    ", end="", flush=True)
 
-            if task_type == "pretrain":
-                history["eval_perplexities"].append(eval_results.get("val_perplexity", 0))
-                if "val_token_accuracy" in eval_results:
-                    history["eval_token_accuracies"].append(eval_results["val_token_accuracy"])
+            # Periodic evaluation
+            if step > 5 and total_training_time - last_eval_time >= eval_interval_seconds:
+                model.eval()
+                eval_results = evaluate(
+                    model, data, task_type, config,
+                    objective=OBJECTIVE, batch_size=actual_batch_size * 2,
+                    device=device, mask_ratio=MASK_RATIO,
+                )
+                history["eval_steps"].append(step)
+                history["eval_scores"].append(eval_results["val_score"])
 
-            if best_val_score is None or eval_results["val_score"] > best_val_score:
-                best_val_score = eval_results["val_score"]
-                best_state_dict = {k: v.clone() for k, v in model.state_dict().items()}
-            model.train()
-            last_eval_time = total_training_time
+                if task_type == "pretrain":
+                    history["eval_perplexities"].append(eval_results.get("val_perplexity", 0))
+                    if "val_token_accuracy" in eval_results:
+                        history["eval_token_accuracies"].append(eval_results["val_token_accuracy"])
 
-        step += 1
+                if best_val_score is None or eval_results["val_score"] > best_val_score:
+                    best_val_score = eval_results["val_score"]
+                    best_state_dict = {k: v.clone() for k, v in model.state_dict().items()}
+                model.train()
+                last_eval_time = total_training_time
+
+            step += 1
+
+            if (step > 5 and total_training_time >= TIME_BUDGET) or _interrupted:
+                break
 
         if (step > 5 and total_training_time >= TIME_BUDGET) or _interrupted:
             break
 
-    if (step > 5 and total_training_time >= TIME_BUDGET) or _interrupted:
-        break
+    print()
 
-print()
+    # ---------------------------------------------------------------------------
+    # Final evaluation
+    # ---------------------------------------------------------------------------
 
-# ---------------------------------------------------------------------------
-# Final evaluation
-# ---------------------------------------------------------------------------
+    model.eval()
+    final_results = evaluate(
+        model, data, task_type, config,
+        objective=OBJECTIVE, batch_size=actual_batch_size * 2,
+        device=device, mask_ratio=MASK_RATIO,
+    )
 
-model.eval()
-final_results = evaluate(
-    model, data, task_type, config,
-    objective=OBJECTIVE, batch_size=actual_batch_size * 2,
-    device=device, mask_ratio=MASK_RATIO,
-)
+    history["eval_steps"].append(step)
+    history["eval_scores"].append(final_results["val_score"])
+    if task_type == "pretrain":
+        history["eval_perplexities"].append(final_results.get("val_perplexity", 0))
+        if "val_token_accuracy" in final_results:
+            history["eval_token_accuracies"].append(final_results["val_token_accuracy"])
 
-history["eval_steps"].append(step)
-history["eval_scores"].append(final_results["val_score"])
-if task_type == "pretrain":
-    history["eval_perplexities"].append(final_results.get("val_perplexity", 0))
-    if "val_token_accuracy" in final_results:
-        history["eval_token_accuracies"].append(final_results["val_token_accuracy"])
-
-if best_state_dict is not None and best_val_score is not None:
-    if best_val_score > final_results["val_score"]:
-        model.load_state_dict(best_state_dict)
-        results = evaluate(
-            model, data, task_type, config,
-            objective=OBJECTIVE, batch_size=actual_batch_size * 2,
-            device=device, mask_ratio=MASK_RATIO,
-        )
+    if best_state_dict is not None and best_val_score is not None:
+        if best_val_score > final_results["val_score"]:
+            model.load_state_dict(best_state_dict)
+            results = evaluate(
+                model, data, task_type, config,
+                objective=OBJECTIVE, batch_size=actual_batch_size * 2,
+                device=device, mask_ratio=MASK_RATIO,
+            )
+        else:
+            results = final_results
     else:
         results = final_results
-else:
-    results = final_results
 
-# ---------------------------------------------------------------------------
-# Summary
-# ---------------------------------------------------------------------------
+    # ---------------------------------------------------------------------------
+    # Summary
+    # ---------------------------------------------------------------------------
 
-t_end = time.time()
+    t_end = time.time()
 
-if device.type == "cuda":
-    peak_vram_mb = torch.cuda.max_memory_allocated() / 1024 / 1024
-else:
-    peak_vram_mb = 0.0
+    if device.type == "cuda":
+        peak_vram_mb = torch.cuda.max_memory_allocated() / 1024 / 1024
+    else:
+        peak_vram_mb = 0.0
 
-print("---")
-print(f"task_type:        {task_type}")
-print(f"objective:        {OBJECTIVE}")
-print(f"val_score:        {results['val_score']:.6f}")
+    print("---")
+    print(f"task_type:        {task_type}")
+    print(f"objective:        {OBJECTIVE}")
+    print(f"val_score:        {results['val_score']:.6f}")
 
-if task_type == "pretrain":
-    print(f"val_perplexity:   {results.get('val_perplexity', 0):.4f}")
-    print(f"val_loss:         {results.get('val_loss', 0):.6f}")
-    if "val_token_accuracy" in results:
-        print(f"val_token_acc:    {results['val_token_accuracy']:.4f}")
-elif task_type == "classify":
-    print(f"val_accuracy:     {results['val_accuracy']:.6f}")
-    print(f"val_f1_macro:     {results['val_f1_macro']:.6f}")
-    print(f"val_f1_weighted:  {results['val_f1_weighted']:.6f}")
-    print(f"val_precision:    {results['val_precision_macro']:.6f}")
-    print(f"val_recall:       {results['val_recall_macro']:.6f}")
-    if "val_roc_auc" in results:
-        print(f"val_roc_auc:      {results['val_roc_auc']:.6f}")
-else:
-    print(f"val_mse:          {results['val_mse']:.6f}")
-    print(f"val_rmse:         {results['val_rmse']:.6f}")
-    print(f"val_mae:          {results['val_mae']:.6f}")
-    print(f"val_r2:           {results['val_r2']:.6f}")
-    print(f"val_pearson_r:    {results['val_pearson_r']:.6f}")
-    if "val_spearman_r" in results:
-        print(f"val_spearman_r:   {results['val_spearman_r']:.6f}")
+    if task_type == "pretrain":
+        print(f"val_perplexity:   {results.get('val_perplexity', 0):.4f}")
+        print(f"val_loss:         {results.get('val_loss', 0):.6f}")
+        if "val_token_accuracy" in results:
+            print(f"val_token_acc:    {results['val_token_accuracy']:.4f}")
+    elif task_type == "classify":
+        print(f"val_accuracy:     {results['val_accuracy']:.6f}")
+        print(f"val_f1_macro:     {results['val_f1_macro']:.6f}")
+        print(f"val_f1_weighted:  {results['val_f1_weighted']:.6f}")
+        print(f"val_precision:    {results['val_precision_macro']:.6f}")
+        print(f"val_recall:       {results['val_recall_macro']:.6f}")
+        if "val_roc_auc" in results:
+            print(f"val_roc_auc:      {results['val_roc_auc']:.6f}")
+    else:
+        print(f"val_mse:          {results['val_mse']:.6f}")
+        print(f"val_rmse:         {results['val_rmse']:.6f}")
+        print(f"val_mae:          {results['val_mae']:.6f}")
+        print(f"val_r2:           {results['val_r2']:.6f}")
+        print(f"val_pearson_r:    {results['val_pearson_r']:.6f}")
+        if "val_spearman_r" in results:
+            print(f"val_spearman_r:   {results['val_spearman_r']:.6f}")
 
-print(f"training_seconds: {total_training_time:.1f}")
-print(f"total_seconds:    {t_end - t_start:.1f}")
-print(f"peak_vram_mb:     {peak_vram_mb:.1f}")
-print(f"num_steps:        {step}")
-print(f"num_epochs:       {epoch}")
-print(f"num_params:       {num_params:,}")
-print(f"model_type:       {MODEL_TYPE}")
-print(f"device:           {device}")
+    print(f"training_seconds: {total_training_time:.1f}")
+    print(f"total_seconds:    {t_end - t_start:.1f}")
+    print(f"peak_vram_mb:     {peak_vram_mb:.1f}")
+    print(f"num_steps:        {step}")
+    print(f"num_epochs:       {epoch}")
+    print(f"num_params:       {num_params:,}")
+    print(f"model_type:       {MODEL_TYPE}")
+    print(f"device:           {device}")
 
-# ---------------------------------------------------------------------------
-# Generate report
-# ---------------------------------------------------------------------------
+    # ---------------------------------------------------------------------------
+    # Generate report
+    # ---------------------------------------------------------------------------
 
-run_info = {
-    "model_type": MODEL_TYPE,
-    "d_model": D_MODEL,
-    "n_layers": N_LAYERS,
-    "n_heads": N_HEADS,
-    "d_ff": D_FF,
-    "dropout": DROPOUT,
-    "objective": OBJECTIVE,
-    "mask_ratio": MASK_RATIO,
-    "learning_rate": LEARNING_RATE,
-    "weight_decay": WEIGHT_DECAY,
-    "batch_size": actual_batch_size,
-    "effective_batch_size": actual_batch_size * GRAD_ACCUM_STEPS,
-    "grad_accum_steps": GRAD_ACCUM_STEPS,
-    "use_amp": amp_enabled,
-    "use_grad_checkpoint": USE_GRAD_CHECKPOINT,
-    "lr_schedule": LR_SCHEDULE,
-    "training_seconds": round(total_training_time, 1),
-    "total_seconds": round(t_end - t_start, 1),
-    "num_steps": step,
-    "num_epochs": epoch,
-    "num_params": num_params,
-    "peak_vram_mb": round(peak_vram_mb, 1),
-    "device": str(device),
-}
-
-# Extract embeddings for t-SNE visualization
-embeddings = None
-embed_labels = None
-try:
-    with torch.no_grad():
-        val_tokens = data["val_tokens"][:200].to(device)
-        val_mask = data["val_mask"][:200].to(device)
-        x = model.embedding(val_tokens)
-        if hasattr(model, 'pos_encoding') and not getattr(model, 'use_custom_layers', False):
-            if model.pos_type == "learned":
-                positions = torch.arange(val_tokens.size(1), device=device)
-                x = x + model.pos_encoding(positions)
-            else:
-                x = model.pos_encoding(x)
-        # Mean pooling over sequence
-        if val_mask is not None:
-            mask_exp = val_mask.unsqueeze(-1).float()
-            embeddings = (x * mask_exp).sum(dim=1) / mask_exp.sum(dim=1).clamp(min=1)
-        else:
-            embeddings = x.mean(dim=1)
-        embeddings = embeddings.cpu().numpy()
-        if "val_labels" in data:
-            embed_labels = data["val_labels"][:200].cpu().numpy()
-except Exception:
-    pass
-
-generate_report(results, task_type, config, training_history=history,
-                report_dir="reports", run_info=run_info,
-                embeddings=embeddings, embed_labels=embed_labels)
-
-# ---------------------------------------------------------------------------
-# Save model checkpoint
-# ---------------------------------------------------------------------------
-
-checkpoint_dir = "checkpoints"
-os.makedirs(checkpoint_dir, exist_ok=True)
-
-checkpoint = {
-    "model_state_dict": model.state_dict(),
-    "model_type": MODEL_TYPE,
-    "model_config": {
-        "vocab_size": vocab_size,
+    run_info = {
+        "model_type": MODEL_TYPE,
         "d_model": D_MODEL,
+        "n_layers": N_LAYERS,
         "n_heads": N_HEADS,
         "d_ff": D_FF,
-        "n_layers": N_LAYERS,
-        "max_len": max_length,
         "dropout": DROPOUT,
-        "task_type": task_type,
-        "n_classes": n_classes,
-        "pos_encoding": POS_ENCODING,
-    },
-    "task_config": config,
-    "results": {k: v for k, v in results.items()
-                if k not in ("predictions", "targets", "probabilities", "confusion_matrix", "per_class")},
-    "run_info": run_info,
-}
-ckpt_path = os.path.join(checkpoint_dir, "best_model.pt")
-torch.save(checkpoint, ckpt_path)
-print(f"\nModel saved to {ckpt_path}")
-print(f"To load: checkpoint = torch.load('{ckpt_path}'); model = build_model(**checkpoint['model_config']); model.load_state_dict(checkpoint['model_state_dict'])")
+        "objective": OBJECTIVE,
+        "mask_ratio": MASK_RATIO,
+        "learning_rate": LEARNING_RATE,
+        "weight_decay": WEIGHT_DECAY,
+        "batch_size": actual_batch_size,
+        "effective_batch_size": actual_batch_size * GRAD_ACCUM_STEPS,
+        "grad_accum_steps": GRAD_ACCUM_STEPS,
+        "use_amp": amp_enabled,
+        "use_grad_checkpoint": USE_GRAD_CHECKPOINT,
+        "lr_schedule": LR_SCHEDULE,
+        "training_seconds": round(total_training_time, 1),
+        "total_seconds": round(t_end - t_start, 1),
+        "num_steps": step,
+        "num_epochs": epoch,
+        "num_params": num_params,
+        "peak_vram_mb": round(peak_vram_mb, 1),
+        "device": str(device),
+    }
 
-# ---------------------------------------------------------------------------
-# Append to experiment log (results.tsv)
-# ---------------------------------------------------------------------------
-
-import csv
-from datetime import datetime
-
-results_file = "results.tsv"
-file_exists = os.path.exists(results_file)
-
-row = {
-    "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-    "model_type": MODEL_TYPE,
-    "objective": OBJECTIVE,
-    "d_model": D_MODEL,
-    "n_layers": N_LAYERS,
-    "n_heads": N_HEADS,
-    "d_ff": D_FF,
-    "pos_encoding": POS_ENCODING,
-    "lr": LEARNING_RATE,
-    "batch_size": actual_batch_size,
-    "val_score": f"{results['val_score']:.6f}",
-    "num_params": num_params,
-    "training_seconds": round(total_training_time, 1),
-    "num_steps": step,
-    "device": str(device),
-}
-
-if task_type == "pretrain":
-    row["val_perplexity"] = f"{results.get('val_perplexity', 0):.4f}"
-    row["val_token_acc"] = f"{results.get('val_token_accuracy', 0):.4f}"
-elif task_type == "classify":
-    row["val_accuracy"] = f"{results['val_accuracy']:.4f}"
-    row["val_f1_macro"] = f"{results['val_f1_macro']:.4f}"
-else:
-    row["val_mse"] = f"{results['val_mse']:.6f}"
-    row["val_r2"] = f"{results['val_r2']:.4f}"
-
-fieldnames = list(row.keys())
-with open(results_file, "a", newline="") as f:
-    writer = csv.DictWriter(f, fieldnames=fieldnames, delimiter="\t")
-    if not file_exists:
-        writer.writeheader()
-    writer.writerow(row)
-
-print(f"Results logged to {results_file}")
-
-# ---------------------------------------------------------------------------
-# Optional: ONNX export
-# ---------------------------------------------------------------------------
-
-if os.environ.get("GENOMIC_EXPORT_ONNX"):
+    # Extract embeddings for t-SNE visualization
+    embeddings = None
+    embed_labels = None
     try:
-        onnx_path = os.environ.get("GENOMIC_EXPORT_ONNX", "model.onnx")
-        dummy_input = torch.randint(5, vocab_size, (1, max_length), device=device)
-        dummy_mask = torch.ones(1, max_length, dtype=torch.long, device=device)
-        # Unwrap DDP if needed
-        export_model = model.module if hasattr(model, 'module') else model
-        export_model.eval()
-        torch.onnx.export(
-            export_model, (dummy_input, dummy_mask), onnx_path,
-            input_names=["input_ids", "attention_mask"],
-            output_names=["logits"],
-            dynamic_axes={"input_ids": {0: "batch", 1: "seq"}, "attention_mask": {0: "batch", 1: "seq"}},
-            opset_version=14,
-        )
-        print(f"ONNX model exported to {onnx_path}")
-    except Exception as e:
-        print(f"ONNX export failed: {e}")
+        with torch.no_grad():
+            val_tokens = data["val_tokens"][:200].to(device)
+            val_mask = data["val_mask"][:200].to(device)
+            x = model.embedding(val_tokens)
+            if hasattr(model, 'pos_encoding') and not getattr(model, 'use_custom_layers', False):
+                if model.pos_type == "learned":
+                    positions = torch.arange(val_tokens.size(1), device=device)
+                    x = x + model.pos_encoding(positions)
+                else:
+                    x = model.pos_encoding(x)
+            # Mean pooling over sequence
+            if val_mask is not None:
+                mask_exp = val_mask.unsqueeze(-1).float()
+                embeddings = (x * mask_exp).sum(dim=1) / mask_exp.sum(dim=1).clamp(min=1)
+            else:
+                embeddings = x.mean(dim=1)
+            embeddings = embeddings.cpu().numpy()
+            if "val_labels" in data:
+                embed_labels = data["val_labels"][:200].cpu().numpy()
+    except Exception:
+        pass
+
+    generate_report(results, task_type, config, training_history=history,
+                    report_dir="reports", run_info=run_info,
+                    embeddings=embeddings, embed_labels=embed_labels)
+
+    # ---------------------------------------------------------------------------
+    # Save model checkpoint
+    # ---------------------------------------------------------------------------
+
+    checkpoint_dir = "checkpoints"
+    os.makedirs(checkpoint_dir, exist_ok=True)
+
+    checkpoint = {
+        "model_state_dict": model.state_dict(),
+        "model_type": MODEL_TYPE,
+        "model_config": {
+            "vocab_size": vocab_size,
+            "d_model": D_MODEL,
+            "n_heads": N_HEADS,
+            "d_ff": D_FF,
+            "n_layers": N_LAYERS,
+            "max_len": max_length,
+            "dropout": DROPOUT,
+            "task_type": task_type,
+            "n_classes": n_classes,
+            "pos_encoding": POS_ENCODING,
+        },
+        "task_config": config,
+        "results": {k: v for k, v in results.items()
+                    if k not in ("predictions", "targets", "probabilities", "confusion_matrix", "per_class")},
+        "run_info": run_info,
+    }
+    ckpt_path = os.path.join(checkpoint_dir, "best_model.pt")
+    torch.save(checkpoint, ckpt_path)
+    print(f"\nModel saved to {ckpt_path}")
+    print(f"To load: checkpoint = torch.load('{ckpt_path}'); model = build_model(**checkpoint['model_config']); model.load_state_dict(checkpoint['model_state_dict'])")
+
+    # ---------------------------------------------------------------------------
+    # Append to experiment log (results.tsv)
+    # ---------------------------------------------------------------------------
+
+    import csv
+    from datetime import datetime
+
+    results_file = "results.tsv"
+    file_exists = os.path.exists(results_file)
+
+    row = {
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "model_type": MODEL_TYPE,
+        "objective": OBJECTIVE,
+        "d_model": D_MODEL,
+        "n_layers": N_LAYERS,
+        "n_heads": N_HEADS,
+        "d_ff": D_FF,
+        "pos_encoding": POS_ENCODING,
+        "lr": LEARNING_RATE,
+        "batch_size": actual_batch_size,
+        "val_score": f"{results['val_score']:.6f}",
+        "num_params": num_params,
+        "training_seconds": round(total_training_time, 1),
+        "num_steps": step,
+        "device": str(device),
+    }
+
+    if task_type == "pretrain":
+        row["val_perplexity"] = f"{results.get('val_perplexity', 0):.4f}"
+        row["val_token_acc"] = f"{results.get('val_token_accuracy', 0):.4f}"
+    elif task_type == "classify":
+        row["val_accuracy"] = f"{results['val_accuracy']:.4f}"
+        row["val_f1_macro"] = f"{results['val_f1_macro']:.4f}"
+    else:
+        row["val_mse"] = f"{results['val_mse']:.6f}"
+        row["val_r2"] = f"{results['val_r2']:.4f}"
+
+    fieldnames = list(row.keys())
+    with open(results_file, "a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames, delimiter="\t")
+        if not file_exists:
+            writer.writeheader()
+        writer.writerow(row)
+
+    print(f"Results logged to {results_file}")
+
+    # ---------------------------------------------------------------------------
+    # Optional: ONNX export
+    # ---------------------------------------------------------------------------
+
+    if os.environ.get("GENOMIC_EXPORT_ONNX"):
+        try:
+            onnx_path = os.environ.get("GENOMIC_EXPORT_ONNX", "model.onnx")
+            dummy_input = torch.randint(5, vocab_size, (1, max_length), device=device)
+            dummy_mask = torch.ones(1, max_length, dtype=torch.long, device=device)
+            # Unwrap DDP if needed
+            export_model = model.module if hasattr(model, 'module') else model
+            export_model.eval()
+            torch.onnx.export(
+                export_model, (dummy_input, dummy_mask), onnx_path,
+                input_names=["input_ids", "attention_mask"],
+                output_names=["logits"],
+                dynamic_axes={"input_ids": {0: "batch", 1: "seq"}, "attention_mask": {0: "batch", 1: "seq"}},
+                opset_version=14,
+            )
+            print(f"ONNX model exported to {onnx_path}")
+        except Exception as e:
+            print(f"ONNX export failed: {e}")

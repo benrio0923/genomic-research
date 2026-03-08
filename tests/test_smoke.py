@@ -256,3 +256,200 @@ class TestEndToEnd:
             os.remove(results_tsv)
         cache_dir = os.path.join(os.path.expanduser("~"), ".cache", "genomic-research")
         shutil.rmtree(cache_dir, ignore_errors=True)
+
+    def test_classify_e2e(self, synthetic_csv):
+        """Run a full classification cycle with minimal time budget."""
+        templates_dir = str(Path(__file__).parent.parent / "genomic_research" / "templates")
+
+        # Run prepare.py for classification
+        result = subprocess.run(
+            [sys.executable, os.path.join(templates_dir, "prepare.py"),
+             "--csv", synthetic_csv, "--seq-col", "sequence",
+             "--task", "classify", "--label-col", "species",
+             "--tokenizer", "char", "--max-length", "64"],
+            capture_output=True, text=True, cwd=templates_dir,
+        )
+        assert result.returncode == 0, f"prepare.py classify failed:\n{result.stderr}"
+        assert "classify" in result.stdout
+
+        # Run train.py
+        env = os.environ.copy()
+        env["GENOMIC_TIME_BUDGET"] = "10"
+        result = subprocess.run(
+            [sys.executable, os.path.join(templates_dir, "train.py")],
+            capture_output=True, text=True, cwd=templates_dir,
+            env=env, timeout=120,
+        )
+        assert result.returncode == 0, f"train.py classify failed:\n{result.stderr}"
+        assert "val_accuracy" in result.stdout
+
+        # Check confusion matrix report
+        reports_dir = os.path.join(templates_dir, "reports")
+        assert os.path.exists(os.path.join(reports_dir, "confusion_matrix.png"))
+
+        with open(os.path.join(reports_dir, "metrics.json")) as f:
+            metrics = json.load(f)
+        assert "val_accuracy" in metrics
+        assert "val_f1_macro" in metrics
+
+        # Clean up
+        import shutil
+        shutil.rmtree(reports_dir, ignore_errors=True)
+        shutil.rmtree(os.path.join(templates_dir, "checkpoints"), ignore_errors=True)
+        results_tsv = os.path.join(templates_dir, "results.tsv")
+        if os.path.exists(results_tsv):
+            os.remove(results_tsv)
+        cache_dir = os.path.join(os.path.expanduser("~"), ".cache", "genomic-research")
+        shutil.rmtree(cache_dir, ignore_errors=True)
+
+    def test_clm_e2e(self, synthetic_fasta):
+        """Run a CLM pre-training cycle."""
+        templates_dir = str(Path(__file__).parent.parent / "genomic_research" / "templates")
+
+        # Prepare
+        result = subprocess.run(
+            [sys.executable, os.path.join(templates_dir, "prepare.py"),
+             "--fasta", synthetic_fasta, "--task", "pretrain",
+             "--tokenizer", "char", "--max-length", "64"],
+            capture_output=True, text=True, cwd=templates_dir,
+        )
+        assert result.returncode == 0, f"prepare.py failed:\n{result.stderr}"
+
+        # Train with CLM objective via config override
+        env = os.environ.copy()
+        env["GENOMIC_TIME_BUDGET"] = "10"
+        config_path = os.path.join(templates_dir, "_test_config.json")
+        with open(config_path, "w") as f:
+            json.dump({"objective": "clm"}, f)
+        env["GENOMIC_CONFIG"] = config_path
+
+        result = subprocess.run(
+            [sys.executable, os.path.join(templates_dir, "train.py")],
+            capture_output=True, text=True, cwd=templates_dir,
+            env=env, timeout=120,
+        )
+        assert result.returncode == 0, f"train.py CLM failed:\n{result.stderr}"
+        assert "clm" in result.stdout
+        assert "val_perplexity" in result.stdout
+
+        # Clean up
+        import shutil
+        os.remove(config_path)
+        shutil.rmtree(os.path.join(templates_dir, "reports"), ignore_errors=True)
+        shutil.rmtree(os.path.join(templates_dir, "checkpoints"), ignore_errors=True)
+        results_tsv = os.path.join(templates_dir, "results.tsv")
+        if os.path.exists(results_tsv):
+            os.remove(results_tsv)
+        cache_dir = os.path.join(os.path.expanduser("~"), ".cache", "genomic-research")
+        shutil.rmtree(cache_dir, ignore_errors=True)
+
+
+class TestInference:
+    """Test inference script."""
+
+    def test_inference_pretrain(self, synthetic_fasta):
+        """Test inference on a pre-trained model."""
+        templates_dir = str(Path(__file__).parent.parent / "genomic_research" / "templates")
+
+        # Prepare + train
+        subprocess.run(
+            [sys.executable, os.path.join(templates_dir, "prepare.py"),
+             "--fasta", synthetic_fasta, "--task", "pretrain",
+             "--tokenizer", "char", "--max-length", "64"],
+            capture_output=True, text=True, cwd=templates_dir,
+        )
+        env = os.environ.copy()
+        env["GENOMIC_TIME_BUDGET"] = "10"
+        subprocess.run(
+            [sys.executable, os.path.join(templates_dir, "train.py")],
+            capture_output=True, text=True, cwd=templates_dir, env=env, timeout=120,
+        )
+
+        ckpt = os.path.join(templates_dir, "checkpoints", "best_model.pt")
+        assert os.path.exists(ckpt), "No checkpoint found for inference test"
+
+        # Run inference
+        result = subprocess.run(
+            [sys.executable, os.path.join(templates_dir, "inference.py"),
+             "--checkpoint", ckpt, "--fasta", synthetic_fasta],
+            capture_output=True, text=True, cwd=templates_dir, timeout=120,
+        )
+        assert result.returncode == 0, f"inference.py failed:\n{result.stderr}"
+
+        # Clean up
+        import shutil
+        shutil.rmtree(os.path.join(templates_dir, "reports"), ignore_errors=True)
+        shutil.rmtree(os.path.join(templates_dir, "checkpoints"), ignore_errors=True)
+        results_tsv = os.path.join(templates_dir, "results.tsv")
+        if os.path.exists(results_tsv):
+            os.remove(results_tsv)
+        cache_dir = os.path.join(os.path.expanduser("~"), ".cache", "genomic-research")
+        shutil.rmtree(cache_dir, ignore_errors=True)
+
+
+class TestKmerVariants:
+    """Test k-mer tokenizer with different k values."""
+
+    def test_kmer_k3(self):
+        sys.path.insert(0, str(Path(__file__).parent.parent / "genomic_research" / "templates"))
+        from prepare import KmerTokenizer
+        tok = KmerTokenizer(k=3)
+        assert tok.vocab_size == 5 + 64  # 4^3 + specials
+        ids = tok.encode("ATCGATCG")
+        decoded = tok.decode(ids)
+        assert decoded == "ATCGATCG"
+
+    def test_kmer_k4(self):
+        sys.path.insert(0, str(Path(__file__).parent.parent / "genomic_research" / "templates"))
+        from prepare import KmerTokenizer
+        tok = KmerTokenizer(k=4)
+        assert tok.vocab_size == 5 + 256  # 4^4 + specials
+        ids = tok.encode("ATCGATCGATCG")
+        decoded = tok.decode(ids)
+        assert decoded == "ATCGATCGATCG"
+
+    def test_kmer_k6(self):
+        sys.path.insert(0, str(Path(__file__).parent.parent / "genomic_research" / "templates"))
+        from prepare import KmerTokenizer
+        tok = KmerTokenizer(k=6)
+        assert tok.vocab_size == 5 + 4096  # 4^6 + specials
+        ids = tok.encode("ATCGATCGATCGATCG")
+        decoded = tok.decode(ids)
+        assert decoded == "ATCGATCGATCGATCG"
+
+
+class TestEdgeCases:
+    """Test edge cases and error handling."""
+
+    def test_file_not_found(self):
+        sys.path.insert(0, str(Path(__file__).parent.parent / "genomic_research" / "templates"))
+        from prepare import prepare_data
+        with pytest.raises(FileNotFoundError):
+            prepare_data("/nonexistent/file.fasta", "pretrain")
+
+    def test_invalid_task_type(self, synthetic_fasta):
+        sys.path.insert(0, str(Path(__file__).parent.parent / "genomic_research" / "templates"))
+        from prepare import prepare_data
+        with pytest.raises(ValueError, match="Unknown task type"):
+            prepare_data(synthetic_fasta, "invalid_task")
+
+    def test_short_sequence(self, synthetic_fasta):
+        """Test with sequences shorter than max_length."""
+        sys.path.insert(0, str(Path(__file__).parent.parent / "genomic_research" / "templates"))
+        from prepare import prepare_data, CACHE_DIR
+        import shutil
+        if os.path.exists(CACHE_DIR):
+            shutil.rmtree(CACHE_DIR)
+        config = prepare_data(synthetic_fasta, "pretrain", max_length=1024)
+        assert config["n_train"] > 0
+        shutil.rmtree(CACHE_DIR)
+
+    def test_single_char_tokenizer_all_n(self):
+        """Test tokenizer with all-N sequence."""
+        sys.path.insert(0, str(Path(__file__).parent.parent / "genomic_research" / "templates"))
+        from prepare import CharTokenizer
+        tok = CharTokenizer()
+        ids = tok.encode("NNNNN")
+        assert len(ids) == 5
+        assert all(i == 9 for i in ids)
+        assert tok.decode(ids) == "NNNNN"
