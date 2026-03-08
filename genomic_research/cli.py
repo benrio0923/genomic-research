@@ -249,6 +249,221 @@ def cmd_benchmark(args):
     shutil.rmtree(cwd, ignore_errors=True)
 
 
+def cmd_info(args):
+    """Show model architecture and hyperparameters from a checkpoint."""
+    import torch
+    import json
+
+    ckpt_path = args.checkpoint
+    if not os.path.exists(ckpt_path):
+        print(f"Error: checkpoint not found: {ckpt_path}", file=sys.stderr)
+        sys.exit(1)
+
+    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+
+    print(f"Checkpoint: {ckpt_path}")
+    print()
+
+    if "model_config" in ckpt:
+        mc = ckpt["model_config"]
+        print("Model Configuration:")
+        for k, v in mc.items():
+            print(f"  {k}: {v}")
+        print()
+
+    if "run_info" in ckpt:
+        ri = ckpt["run_info"]
+        print("Run Info:")
+        for k, v in ri.items():
+            print(f"  {k}: {v}")
+        print()
+
+    if "results" in ckpt:
+        print("Results:")
+        for k, v in ckpt["results"].items():
+            if isinstance(v, float):
+                print(f"  {k}: {v:.6f}")
+            else:
+                print(f"  {k}: {v}")
+        print()
+
+    # Parameter count
+    if "model_state_dict" in ckpt:
+        total = sum(v.numel() for v in ckpt["model_state_dict"].values())
+        print(f"Total parameters: {total:,}")
+
+    print(f"Keys in checkpoint: {list(ckpt.keys())}")
+
+
+def cmd_evaluate(args):
+    """Evaluate a trained model on new data."""
+    import torch
+
+    ckpt_path = args.checkpoint
+    if not os.path.exists(ckpt_path):
+        print(f"Error: checkpoint not found: {ckpt_path}", file=sys.stderr)
+        sys.exit(1)
+
+    # Load checkpoint
+    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    model_config = ckpt.get("model_config", {})
+    task_type = model_config.get("task_type", "pretrain")
+
+    # We need prepare.py and train.py accessible
+    # Use templates if not in current dir
+    cwd = Path.cwd()
+    for f in ["prepare.py", "train.py"]:
+        if not (cwd / f).exists():
+            src = TEMPLATES_DIR / f
+            shutil.copy2(src, cwd / f)
+            print(f"  [copy] {f}")
+
+    # Prepare new data
+    seq_path = args.fasta or args.csv
+    if seq_path is None:
+        print("Error: must specify --fasta or --csv for evaluation data", file=sys.stderr)
+        sys.exit(1)
+
+    prepare_cmd = [sys.executable, str(cwd / "prepare.py")]
+    if args.fasta:
+        prepare_cmd.extend(["--fasta", args.fasta])
+    elif args.csv:
+        prepare_cmd.extend(["--csv", args.csv])
+    if args.seq_col:
+        prepare_cmd.extend(["--seq-col", args.seq_col])
+    prepare_cmd.extend(["--task", task_type])
+    if args.labels:
+        prepare_cmd.extend(["--labels", args.labels])
+    if args.label_col:
+        prepare_cmd.extend(["--label-col", args.label_col])
+
+    result = subprocess.run(prepare_cmd, cwd=cwd)
+    if result.returncode != 0:
+        print("\nError: data preparation failed.", file=sys.stderr)
+        sys.exit(1)
+
+    # Import and run evaluation
+    sys.path.insert(0, str(cwd))
+    from prepare import load_config, load_data, evaluate
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    config = load_config()
+    data = load_data(device=device)
+
+    # Rebuild model from checkpoint config
+    from train import build_model
+    model = build_model(**model_config).to(device)
+    model.load_state_dict(ckpt["model_state_dict"])
+    model.eval()
+
+    results = evaluate(
+        model, data, task_type, config,
+        objective=ckpt.get("run_info", {}).get("objective", "mlm"),
+        batch_size=32, device=device,
+    )
+
+    print("\n--- Evaluation Results ---")
+    for k, v in results.items():
+        if k in ("predictions", "targets", "probabilities", "confusion_matrix", "per_class"):
+            continue
+        if isinstance(v, float):
+            print(f"  {k}: {v:.6f}")
+        else:
+            print(f"  {k}: {v}")
+
+
+def cmd_predict(args):
+    """Run prediction on new sequences using a trained model."""
+    import torch
+    import csv
+
+    ckpt_path = args.checkpoint
+    if not os.path.exists(ckpt_path):
+        print(f"Error: checkpoint not found: {ckpt_path}", file=sys.stderr)
+        sys.exit(1)
+
+    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    model_config = ckpt.get("model_config", {})
+    task_type = model_config.get("task_type", "pretrain")
+
+    if task_type == "pretrain":
+        print("Note: predict command works best with classify/regress models.")
+        print("For pre-trained models, use 'embed' command to extract embeddings.")
+
+    cwd = Path.cwd()
+    for f in ["prepare.py", "train.py"]:
+        if not (cwd / f).exists():
+            shutil.copy2(TEMPLATES_DIR / f, cwd / f)
+
+    # Prepare data
+    seq_path = args.fasta or args.csv
+    if seq_path is None:
+        print("Error: must specify --fasta or --csv", file=sys.stderr)
+        sys.exit(1)
+
+    prepare_cmd = [sys.executable, str(cwd / "prepare.py")]
+    if args.fasta:
+        prepare_cmd.extend(["--fasta", args.fasta])
+    elif args.csv:
+        prepare_cmd.extend(["--csv", args.csv])
+    if args.seq_col:
+        prepare_cmd.extend(["--seq-col", args.seq_col])
+    prepare_cmd.extend(["--task", task_type])
+
+    result = subprocess.run(prepare_cmd, cwd=cwd, capture_output=True)
+    if result.returncode != 0:
+        print("\nError: data preparation failed.", file=sys.stderr)
+        sys.exit(1)
+
+    sys.path.insert(0, str(cwd))
+    from prepare import load_config, load_data
+    from train import build_model
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    config = load_config()
+    data = load_data(device=device)
+
+    model = build_model(**model_config).to(device)
+    model.load_state_dict(ckpt["model_state_dict"])
+    model.eval()
+
+    # Run predictions
+    all_tokens = data.get("val_tokens", data.get("train_tokens"))
+    all_masks = data.get("val_mask", data.get("train_mask"))
+
+    predictions = []
+    batch_size = 32
+    with torch.no_grad():
+        for i in range(0, len(all_tokens), batch_size):
+            batch_tokens = all_tokens[i:i + batch_size].to(device)
+            batch_mask = all_masks[i:i + batch_size].to(device)
+            output = model(batch_tokens, attention_mask=batch_mask)
+
+            if task_type == "classify":
+                preds = output.argmax(dim=-1).cpu().tolist()
+                probs = torch.softmax(output, dim=-1).cpu().tolist()
+                for j, (p, pr) in enumerate(zip(preds, probs)):
+                    predictions.append({"index": i + j, "prediction": p, "confidence": max(pr)})
+            elif task_type == "regress":
+                preds = output.squeeze(-1).cpu().tolist()
+                for j, p in enumerate(preds):
+                    predictions.append({"index": i + j, "prediction": p})
+            else:
+                # Pre-train: skip per-sequence prediction
+                break
+
+    # Write output
+    output_path = args.output or "predictions.csv"
+    if predictions:
+        with open(output_path, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=predictions[0].keys())
+            writer.writeheader()
+            writer.writerows(predictions)
+        print(f"Predictions saved to {output_path} ({len(predictions)} samples)")
+    else:
+        print("No predictions generated (model may be pre-train only).")
+
+
 def main():
     parser = argparse.ArgumentParser(
         prog="genomic-research",
@@ -294,6 +509,27 @@ def main():
     p_bench.add_argument("--seq-length", type=int, default=500, help="Synthetic sequence length")
     p_bench.add_argument("--n-sequences", type=int, default=100, help="Number of synthetic sequences")
 
+    # info
+    p_info = subparsers.add_parser("info", help="Show model info from checkpoint")
+    p_info.add_argument("--checkpoint", type=str, required=True, help="Path to model checkpoint (.pt)")
+
+    # evaluate
+    p_eval = subparsers.add_parser("evaluate", help="Evaluate trained model on new data")
+    p_eval.add_argument("--checkpoint", type=str, required=True, help="Path to model checkpoint (.pt)")
+    p_eval.add_argument("--fasta", type=str, default=None, help="Path to FASTA/FASTQ file")
+    p_eval.add_argument("--csv", type=str, default=None, help="Path to CSV file")
+    p_eval.add_argument("--seq-col", type=str, default=None, help="Sequence column name (CSV)")
+    p_eval.add_argument("--labels", type=str, default=None, help="Labels CSV (for computing metrics)")
+    p_eval.add_argument("--label-col", type=str, default=None, help="Label column name")
+
+    # predict
+    p_pred = subparsers.add_parser("predict", help="Run prediction on new sequences")
+    p_pred.add_argument("--checkpoint", type=str, required=True, help="Path to model checkpoint (.pt)")
+    p_pred.add_argument("--fasta", type=str, default=None, help="Path to FASTA/FASTQ file")
+    p_pred.add_argument("--csv", type=str, default=None, help="Path to CSV file")
+    p_pred.add_argument("--seq-col", type=str, default=None, help="Sequence column name (CSV)")
+    p_pred.add_argument("--output", type=str, default="predictions.csv", help="Output file path")
+
     args = parser.parse_args()
 
     if args.command == "init":
@@ -306,6 +542,12 @@ def main():
         cmd_clean(args)
     elif args.command == "benchmark":
         cmd_benchmark(args)
+    elif args.command == "info":
+        cmd_info(args)
+    elif args.command == "evaluate":
+        cmd_evaluate(args)
+    elif args.command == "predict":
+        cmd_predict(args)
     else:
         parser.print_help()
 
