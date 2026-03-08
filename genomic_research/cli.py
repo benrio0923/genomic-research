@@ -667,6 +667,299 @@ def cmd_export(args):
     print(f"  Input:      tokens[batch, {seq_len}] + mask[batch, {seq_len}]")
 
 
+def cmd_search(args):
+    """Search NCBI for sequences and optionally download them."""
+    try:
+        from Bio import Entrez, SeqIO
+    except ImportError:
+        print("Error: BioPython required. Install with: pip install biopython")
+        return
+
+    Entrez.email = args.email or "genomic-research-user@example.com"
+    db = args.database
+    query = args.query
+    max_results = args.max_results
+
+    print(f"Searching NCBI {db} for: {query}")
+
+    # Search
+    handle = Entrez.esearch(db=db, term=query, retmax=max_results)
+    results = Entrez.read(handle)
+    handle.close()
+
+    ids = results.get("IdList", [])
+    total = results.get("Count", "?")
+    print(f"Found {total} results, showing top {len(ids)}")
+
+    if not ids:
+        print("No results found.")
+        return
+
+    # Fetch summaries
+    handle = Entrez.esummary(db=db, id=",".join(ids))
+    summaries = Entrez.read(handle)
+    handle.close()
+
+    for i, doc in enumerate(summaries):
+        title = doc.get("Title", "N/A")
+        accession = doc.get("AccessionVersion", doc.get("Caption", "N/A"))
+        length = doc.get("Length", doc.get("Slen", "?"))
+        organism = doc.get("Organism", "N/A")
+        print(f"\n  [{i+1}] {accession}")
+        print(f"      {title[:80]}")
+        print(f"      Organism: {organism} | Length: {length}")
+
+    # Download if requested
+    if args.output:
+        print(f"\nDownloading {len(ids)} sequences to {args.output}...")
+        handle = Entrez.efetch(db=db, id=",".join(ids), rettype="fasta", retmode="text")
+        with open(args.output, "w") as f:
+            f.write(handle.read())
+        handle.close()
+        print(f"Saved to {args.output}")
+        print(f"Initialize with: genomic-research init --fasta {args.output} --task pretrain")
+
+
+def cmd_dashboard(args):
+    """Generate interactive HTML experiment dashboard."""
+    import csv
+    from pathlib import Path
+
+    results_file = args.results or "results.tsv"
+    report_dir = args.report_dir or "reports"
+    output = args.output or "dashboard.html"
+
+    # Load experiment results
+    experiments = []
+    if os.path.exists(results_file):
+        with open(results_file, newline="") as f:
+            reader = csv.DictReader(f, delimiter="\t")
+            for row in reader:
+                experiments.append(row)
+
+    # Load metrics.json if available
+    metrics = {}
+    metrics_path = os.path.join(report_dir, "metrics.json")
+    if os.path.exists(metrics_path):
+        import json
+        with open(metrics_path) as f:
+            metrics = json.load(f)
+
+    # Find report images
+    images = []
+    if os.path.isdir(report_dir):
+        import base64
+        for fname in sorted(os.listdir(report_dir)):
+            if fname.endswith(".png"):
+                img_path = os.path.join(report_dir, fname)
+                with open(img_path, "rb") as f:
+                    b64 = base64.b64encode(f.read()).decode()
+                images.append({"name": fname, "data": b64})
+
+    # Generate HTML
+    html_parts = [
+        "<!DOCTYPE html><html><head>",
+        "<meta charset='utf-8'>",
+        "<title>genomic-research Dashboard</title>",
+        "<style>",
+        "body{font-family:system-ui,-apple-system,sans-serif;max-width:1200px;margin:0 auto;padding:20px;background:#f5f5f5}",
+        "h1{color:#1a237e}h2{color:#283593;border-bottom:2px solid #e8eaf6;padding-bottom:8px}",
+        ".card{background:white;border-radius:8px;padding:20px;margin:16px 0;box-shadow:0 2px 4px rgba(0,0,0,0.1)}",
+        "table{border-collapse:collapse;width:100%;font-size:14px}",
+        "th,td{padding:8px 12px;text-align:left;border-bottom:1px solid #e0e0e0}",
+        "th{background:#e8eaf6;font-weight:600}tr:hover{background:#f5f5f5}",
+        ".img-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(400px,1fr));gap:16px}",
+        ".img-card{background:white;border-radius:8px;padding:12px;box-shadow:0 1px 3px rgba(0,0,0,0.1)}",
+        ".img-card img{width:100%;border-radius:4px}",
+        ".metric{display:inline-block;background:#e8eaf6;padding:8px 16px;border-radius:20px;margin:4px;font-weight:600}",
+        ".good{color:#2e7d32}.bad{color:#c62828}",
+        "</style></head><body>",
+        "<h1>genomic-research Experiment Dashboard</h1>",
+    ]
+
+    # Metrics summary
+    if metrics:
+        html_parts.append("<div class='card'><h2>Latest Results</h2><div>")
+        for key in ["val_score", "val_perplexity", "val_loss", "val_token_accuracy",
+                     "val_accuracy", "val_f1_macro", "val_mse", "val_r2"]:
+            if key in metrics:
+                val = metrics[key]
+                cls = "good" if ("accuracy" in key or "f1" in key or "r2" in key) else ""
+                html_parts.append(f"<span class='metric {cls}'>{key}: {val}</span>")
+        html_parts.append("</div></div>")
+
+    # Experiment history table
+    if experiments:
+        html_parts.append("<div class='card'><h2>Experiment History</h2><table><tr>")
+        cols = list(experiments[0].keys())
+        for c in cols:
+            html_parts.append(f"<th>{c}</th>")
+        html_parts.append("</tr>")
+        for exp in experiments:
+            html_parts.append("<tr>")
+            for c in cols:
+                html_parts.append(f"<td>{exp.get(c, '')}</td>")
+            html_parts.append("</tr>")
+        html_parts.append("</table></div>")
+
+    # Images
+    if images:
+        html_parts.append("<div class='card'><h2>Report Visualizations</h2><div class='img-grid'>")
+        for img in images:
+            name = img["name"].replace(".png", "").replace("_", " ").title()
+            html_parts.append(f"<div class='img-card'><h3>{name}</h3>")
+            html_parts.append(f"<img src='data:image/png;base64,{img['data']}' alt='{name}'></div>")
+        html_parts.append("</div></div>")
+
+    html_parts.append(f"<p style='color:#999;text-align:center;margin-top:40px'>Generated by genomic-research</p>")
+    html_parts.append("</body></html>")
+
+    with open(output, "w") as f:
+        f.write("\n".join(html_parts))
+    print(f"Dashboard saved to {output}")
+    print(f"Open in browser: file://{os.path.abspath(output)}")
+
+
+def cmd_learning_curve(args):
+    """Run learning curve analysis — train with different data fractions."""
+    fractions = [0.1, 0.25, 0.5, 0.75, 1.0]
+    checkpoint = args.checkpoint or "checkpoints/best_model.pt"
+
+    if not os.path.exists(checkpoint):
+        print(f"Error: Checkpoint not found: {checkpoint}")
+        return
+
+    print("Learning Curve Analysis")
+    print("=" * 40)
+    print(f"Data fractions: {fractions}")
+    print(f"This will run {len(fractions)} training runs.\n")
+    print("To run: set GENOMIC_DATA_FRACTION environment variable before each training run.")
+    print("Example:")
+    for frac in fractions:
+        print(f"  GENOMIC_DATA_FRACTION={frac} GENOMIC_TIME_BUDGET=60 python train.py")
+    print(f"\nThen compare results in results.tsv or use: genomic-research dashboard")
+
+
+def cmd_motif_discovery(args):
+    """Discover motifs from attention weights of a trained model."""
+    import torch
+
+    checkpoint = args.checkpoint or "checkpoints/best_model.pt"
+    if not os.path.exists(checkpoint):
+        print(f"Error: Checkpoint not found: {checkpoint}")
+        return
+
+    top_k = args.top_k or 10
+    window = args.window or 8
+
+    # Load model
+    ckpt = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    mc = ckpt["model_config"]
+    task_config = ckpt.get("task_config", {})
+
+    sys.path.insert(0, ".")
+    from train import build_model
+    model = build_model(**mc)
+    model.load_state_dict(ckpt["model_state_dict"])
+    model.eval()
+
+    # Load data
+    from prepare import load_data, load_config
+    config = load_config()
+    data = load_data(device="cpu")
+
+    # Extract attention for first N validation sequences
+    n_samples = min(50, len(data["val_tokens"]))
+    val_tokens = data["val_tokens"][:n_samples]
+    val_mask = data["val_mask"][:n_samples]
+
+    print(f"Extracting attention from {n_samples} sequences...")
+
+    # Check if model has attention layers
+    if not hasattr(model, 'layers'):
+        print("Model does not have attention layers (requires Transformer).")
+        return
+
+    # Get attention weights from first layer
+    motif_regions = []
+    try:
+        with torch.no_grad():
+            x = model.embedding(val_tokens)
+            if hasattr(model, 'emb_dropout'):
+                x = model.emb_dropout(x)
+
+            layer = model.layers[0]
+            h = layer.norm1(x) if hasattr(layer, 'norm1') else x
+            B, L, D = h.shape
+            n_heads = layer.n_heads if hasattr(layer, 'n_heads') else 1
+            head_dim = D // n_heads
+
+            q = layer.q_proj(h).view(B, L, n_heads, head_dim).transpose(1, 2)
+            k = layer.k_proj(h).view(B, L, n_heads, head_dim).transpose(1, 2)
+            scale = head_dim ** -0.5
+            attn = torch.matmul(q, k.transpose(-2, -1)) * scale
+            pad_mask = (val_mask == 0).unsqueeze(1).unsqueeze(2)
+            attn = attn.masked_fill(pad_mask, float("-inf"))
+            attn = torch.softmax(attn, dim=-1)
+
+            # Average over heads → (B, L, L), then sum over keys → per-position importance
+            attn_avg = attn.mean(dim=1)  # (B, L, L)
+            importance = attn_avg.sum(dim=-1)  # (B, L)
+
+            # Find top-k high-attention regions per sequence
+            # Decode tokens back to nucleotides
+            nuc_map = {5: "A", 6: "T", 7: "C", 8: "G", 9: "N"}
+
+            for i in range(B):
+                seq_len = int(val_mask[i].sum().item())
+                if seq_len < window + 2:
+                    continue
+                imp = importance[i, 1:seq_len-1]  # skip CLS/SEP
+                tokens = val_tokens[i, 1:seq_len-1]
+
+                # Sliding window: find highest-importance windows
+                for start in range(0, len(imp) - window + 1):
+                    score = imp[start:start+window].mean().item()
+                    motif_seq = "".join(nuc_map.get(t.item(), "N") for t in tokens[start:start+window])
+                    motif_regions.append((score, motif_seq))
+
+    except Exception as e:
+        print(f"Attention extraction failed: {e}")
+        return
+
+    if not motif_regions:
+        print("No motif regions found.")
+        return
+
+    # Sort by attention score and find consensus
+    motif_regions.sort(key=lambda x: -x[0])
+    top_motifs = motif_regions[:top_k * 5]
+
+    # Simple consensus: count nucleotide frequencies at each position
+    from collections import Counter
+    pos_counts = [Counter() for _ in range(window)]
+    for _, motif in top_motifs[:top_k]:
+        for j, c in enumerate(motif):
+            pos_counts[j][c] += 1
+
+    consensus = "".join(c.most_common(1)[0][0] for c in pos_counts)
+
+    print(f"\nTop {min(top_k, len(motif_regions))} high-attention motifs:")
+    for score, motif in motif_regions[:top_k]:
+        print(f"  {motif}  (attention score: {score:.4f})")
+
+    print(f"\nConsensus motif: {consensus}")
+
+    # Save to file
+    os.makedirs("reports", exist_ok=True)
+    with open("reports/motifs.txt", "w") as f:
+        f.write(f"Consensus: {consensus}\n\n")
+        f.write("Top motifs by attention score:\n")
+        for score, motif in motif_regions[:top_k * 3]:
+            f.write(f"  {motif}\t{score:.4f}\n")
+    print("Saved to reports/motifs.txt")
+
+
 def cmd_compare(args):
     """Compare two experiment results (metrics.json files)."""
     import json
@@ -799,6 +1092,31 @@ def main():
     p_compare.add_argument("file1", type=str, help="First metrics.json file")
     p_compare.add_argument("file2", type=str, help="Second metrics.json file")
 
+    # search
+    p_search = subparsers.add_parser("search", help="Search NCBI for sequences")
+    p_search.add_argument("query", type=str, help="Search query (e.g., 'SARS-CoV-2[organism]')")
+    p_search.add_argument("--database", "-d", type=str, default="nucleotide",
+                          help="NCBI database (nucleotide, protein, gene)")
+    p_search.add_argument("--max-results", "-n", type=int, default=10, help="Max results to show")
+    p_search.add_argument("--output", "-o", type=str, default=None, help="Download FASTA to this file")
+    p_search.add_argument("--email", type=str, default=None, help="Email for NCBI Entrez API")
+
+    # dashboard
+    p_dash = subparsers.add_parser("dashboard", help="Generate interactive HTML experiment dashboard")
+    p_dash.add_argument("--results", type=str, default="results.tsv", help="Results TSV file")
+    p_dash.add_argument("--report-dir", type=str, default="reports", help="Report directory with plots")
+    p_dash.add_argument("--output", "-o", type=str, default="dashboard.html", help="Output HTML file")
+
+    # learning-curve
+    p_lc = subparsers.add_parser("learning-curve", help="Run learning curve analysis")
+    p_lc.add_argument("--checkpoint", type=str, default="checkpoints/best_model.pt", help="Model checkpoint")
+
+    # motif-discovery
+    p_motif = subparsers.add_parser("motif-discovery", help="Discover motifs from attention weights")
+    p_motif.add_argument("--checkpoint", type=str, default="checkpoints/best_model.pt", help="Model checkpoint")
+    p_motif.add_argument("--top-k", type=int, default=10, help="Number of top motifs to show")
+    p_motif.add_argument("--window", type=int, default=8, help="Motif window size")
+
     args = parser.parse_args()
 
     if args.command == "init":
@@ -823,6 +1141,14 @@ def main():
         cmd_compare(args)
     elif args.command == "export":
         cmd_export(args)
+    elif args.command == "search":
+        cmd_search(args)
+    elif args.command == "dashboard":
+        cmd_dashboard(args)
+    elif args.command == "learning-curve":
+        cmd_learning_curve(args)
+    elif args.command == "motif-discovery":
+        cmd_motif_discovery(args)
     else:
         parser.print_help()
 
