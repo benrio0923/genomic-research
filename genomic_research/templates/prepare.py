@@ -1170,13 +1170,14 @@ def _evaluate_regress(model, val_tokens, val_mask, val_labels, batch_size, devic
 
 def generate_report(results, task_type, config, training_history=None,
                     report_dir="reports", run_info=None, embeddings=None, embed_labels=None,
-                    attention_weights=None):
+                    attention_weights=None, model_weights=None):
     """Generate experiment report with plots and metrics.
 
     Args:
         embeddings: Optional (N, D) numpy array of sequence embeddings for t-SNE.
         embed_labels: Optional (N,) labels for coloring t-SNE points.
         attention_weights: Optional (L, L) attention weight matrix for heatmap.
+        model_weights: Optional dict of {name: numpy_array} for weight distribution plots.
     """
     import matplotlib
     matplotlib.use("Agg")
@@ -1459,6 +1460,70 @@ def generate_report(results, task_type, config, training_history=None,
                     fig.tight_layout()
                     fig.savefig(os.path.join(report_dir, "length_bias.png"), dpi=150)
                     plt.close(fig)
+        except Exception:
+            pass
+
+    # --- Weight distribution analysis (T106) ---
+    if model_weights:
+        try:
+            # Group weights by top-level module
+            groups = {}
+            for name, w in model_weights.items():
+                group = name.split(".")[0]
+                groups.setdefault(group, []).append(w.flatten())
+
+            n_groups = min(len(groups), 9)
+            if n_groups >= 1:
+                sorted_groups = sorted(groups.items(), key=lambda x: sum(len(a) for a in x[1]), reverse=True)
+                ncols = min(3, n_groups)
+                nrows = (n_groups + ncols - 1) // ncols
+                fig, axes = plt.subplots(nrows, ncols, figsize=(5 * ncols, 3 * nrows))
+                if n_groups == 1:
+                    axes = np.array([axes])
+                axes = axes.flatten()
+
+                for i, (group, arrays) in enumerate(sorted_groups[:n_groups]):
+                    all_w = np.concatenate(arrays)
+                    ax = axes[i]
+                    ax.hist(all_w, bins=50, color="#2196F3", alpha=0.7, edgecolor="none")
+                    ax.set_title(f"{group} ({len(all_w):,})", fontsize=9)
+                    ax.set_xlabel("Value", fontsize=8)
+                    ax.tick_params(labelsize=7)
+
+                for i in range(n_groups, len(axes)):
+                    axes[i].set_visible(False)
+
+                fig.suptitle("Weight Distributions by Layer Group", fontsize=11)
+                fig.tight_layout()
+                fig.savefig(os.path.join(report_dir, "weight_distribution.png"), dpi=150)
+                plt.close(fig)
+        except Exception:
+            pass
+
+    # --- Statistical significance (T108) ---
+    if results.get("predictions") is not None and results.get("targets") is not None:
+        try:
+            preds_arr = np.array(results["predictions"])
+            targets_arr = np.array(results["targets"])
+            n_bootstrap = 1000
+            rng = np.random.RandomState(42)
+
+            if task_type == "classify":
+                # Bootstrap accuracy CI
+                accs = []
+                for _ in range(n_bootstrap):
+                    idx = rng.choice(len(preds_arr), size=len(preds_arr), replace=True)
+                    accs.append(float((preds_arr[idx] == targets_arr[idx]).mean()))
+                ci_low, ci_high = np.percentile(accs, [2.5, 97.5])
+                results["accuracy_ci_95"] = [round(ci_low, 4), round(ci_high, 4)]
+            elif task_type == "regress":
+                # Bootstrap MSE CI
+                mses = []
+                for _ in range(n_bootstrap):
+                    idx = rng.choice(len(preds_arr), size=len(preds_arr), replace=True)
+                    mses.append(float(np.mean((preds_arr[idx] - targets_arr[idx]) ** 2)))
+                ci_low, ci_high = np.percentile(mses, [2.5, 97.5])
+                results["mse_ci_95"] = [round(ci_low, 4), round(ci_high, 4)]
         except Exception:
             pass
 

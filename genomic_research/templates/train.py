@@ -1887,10 +1887,19 @@ if __name__ == "__main__":
         except Exception:
             pass
 
+    # Collect model weights for distribution analysis
+    _model_weights = {}
+    try:
+        for name, param in model.named_parameters():
+            _model_weights[name] = param.detach().cpu().numpy()
+    except Exception:
+        _model_weights = None
+
     generate_report(results, task_type, config, training_history=history,
                     report_dir="reports", run_info=run_info,
                     embeddings=embeddings, embed_labels=embed_labels,
-                    attention_weights=attention_weights)
+                    attention_weights=attention_weights,
+                    model_weights=_model_weights)
 
     # ---------------------------------------------------------------------------
     # Save model checkpoint

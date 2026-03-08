@@ -468,6 +468,117 @@ def cmd_predict(args):
         print("No predictions generated (model may be pre-train only).")
 
 
+def cmd_embed(args):
+    """Extract sequence embeddings and save to file."""
+    import torch
+    import numpy as np
+
+    ckpt_path = args.checkpoint
+    if not os.path.exists(ckpt_path):
+        print(f"Error: checkpoint not found: {ckpt_path}", file=sys.stderr)
+        sys.exit(1)
+
+    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    model_config = ckpt.get("model_config", {})
+
+    cwd = Path.cwd()
+    for f in ["prepare.py", "train.py"]:
+        if not (cwd / f).exists():
+            shutil.copy2(TEMPLATES_DIR / f, cwd / f)
+
+    seq_path = args.fasta or args.csv
+    if seq_path is None:
+        print("Error: must specify --fasta or --csv", file=sys.stderr)
+        sys.exit(1)
+
+    prepare_cmd = [sys.executable, str(cwd / "prepare.py")]
+    if args.fasta:
+        prepare_cmd.extend(["--fasta", args.fasta])
+    elif args.csv:
+        prepare_cmd.extend(["--csv", args.csv])
+    if args.seq_col:
+        prepare_cmd.extend(["--seq-col", args.seq_col])
+    prepare_cmd.extend(["--task", "pretrain"])
+
+    result = subprocess.run(prepare_cmd, cwd=cwd, capture_output=True)
+    if result.returncode != 0:
+        print("\nError: data preparation failed.", file=sys.stderr)
+        sys.exit(1)
+
+    sys.path.insert(0, str(cwd))
+    from prepare import load_config, load_data
+    from train import build_model
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    config = load_config()
+    data = load_data(device=device)
+
+    model = build_model(**model_config).to(device)
+    model.load_state_dict(ckpt["model_state_dict"])
+    model.eval()
+
+    # Extract embeddings via mean pooling
+    all_tokens = torch.cat([data["train_tokens"], data["val_tokens"]])
+    all_masks = torch.cat([data["train_mask"], data["val_mask"]])
+
+    embeddings = []
+    batch_size = 32
+    with torch.no_grad():
+        for i in range(0, len(all_tokens), batch_size):
+            batch_tokens = all_tokens[i:i + batch_size].to(device)
+            batch_mask = all_masks[i:i + batch_size].to(device)
+            x = model.embedding(batch_tokens)
+            # Mean pooling over non-padding positions
+            mask_exp = batch_mask.unsqueeze(-1).float()
+            pooled = (x * mask_exp).sum(dim=1) / mask_exp.sum(dim=1).clamp(min=1)
+            embeddings.append(pooled.cpu().numpy())
+
+    embeddings = np.concatenate(embeddings, axis=0)
+    output_path = args.output or "embeddings.npy"
+    np.save(output_path, embeddings)
+    print(f"Embeddings saved to {output_path} — shape: {embeddings.shape}")
+
+
+def cmd_compare(args):
+    """Compare two experiment results (metrics.json files)."""
+    import json
+
+    path1 = args.file1
+    path2 = args.file2
+
+    if not os.path.exists(path1):
+        print(f"Error: file not found: {path1}", file=sys.stderr)
+        sys.exit(1)
+    if not os.path.exists(path2):
+        print(f"Error: file not found: {path2}", file=sys.stderr)
+        sys.exit(1)
+
+    with open(path1) as f:
+        m1 = json.load(f)
+    with open(path2) as f:
+        m2 = json.load(f)
+
+    # Collect all numeric metrics
+    all_keys = sorted(set(list(m1.keys()) + list(m2.keys())))
+    skip_keys = {"predictions", "targets", "probabilities", "confusion_matrix",
+                 "per_class", "run_info", "metric_direction"}
+
+    print(f"{'Metric':<30} {'File 1':>12} {'File 2':>12} {'Delta':>12} {'Change':>8}")
+    print("-" * 76)
+    for key in all_keys:
+        if key in skip_keys:
+            continue
+        v1 = m1.get(key)
+        v2 = m2.get(key)
+        if not isinstance(v1, (int, float)) or not isinstance(v2, (int, float)):
+            continue
+        delta = v2 - v1
+        pct = (delta / abs(v1) * 100) if v1 != 0 else 0
+        sign = "+" if delta > 0 else ""
+        # Green for improvements in val_score, red for degradation
+        print(f"{key:<30} {v1:>12.4f} {v2:>12.4f} {sign}{delta:>11.4f} {sign}{pct:>6.1f}%")
+
+
 def main():
     parser = argparse.ArgumentParser(
         prog="genomic-research",
@@ -539,6 +650,19 @@ def main():
     p_pred.add_argument("--seq-col", type=str, default=None, help="Sequence column name (CSV)")
     p_pred.add_argument("--output", type=str, default="predictions.csv", help="Output file path")
 
+    # embed
+    p_embed = subparsers.add_parser("embed", help="Extract sequence embeddings")
+    p_embed.add_argument("--checkpoint", type=str, required=True, help="Path to model checkpoint (.pt)")
+    p_embed.add_argument("--fasta", type=str, default=None, help="Path to FASTA/FASTQ file")
+    p_embed.add_argument("--csv", type=str, default=None, help="Path to CSV file")
+    p_embed.add_argument("--seq-col", type=str, default=None, help="Sequence column name (CSV)")
+    p_embed.add_argument("--output", type=str, default="embeddings.npy", help="Output file (.npy)")
+
+    # compare
+    p_compare = subparsers.add_parser("compare", help="Compare two experiment results")
+    p_compare.add_argument("file1", type=str, help="First metrics.json file")
+    p_compare.add_argument("file2", type=str, help="Second metrics.json file")
+
     args = parser.parse_args()
 
     if args.command == "init":
@@ -557,6 +681,10 @@ def main():
         cmd_evaluate(args)
     elif args.command == "predict":
         cmd_predict(args)
+    elif args.command == "embed":
+        cmd_embed(args)
+    elif args.command == "compare":
+        cmd_compare(args)
     else:
         parser.print_help()
 
