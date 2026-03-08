@@ -95,6 +95,10 @@ def cmd_init(args):
         prepare_cmd.extend(["--labels", args.labels])
     if args.label_col:
         prepare_cmd.extend(["--label-col", args.label_col])
+    if args.sample_n:
+        prepare_cmd.extend(["--sample-n", str(args.sample_n)])
+    if args.sample_frac > 0:
+        prepare_cmd.extend(["--sample-frac", str(args.sample_frac)])
 
     result = subprocess.run(prepare_cmd, cwd=cwd)
     if result.returncode != 0:
@@ -266,6 +270,8 @@ def main():
     p_init.add_argument("--id-col", type=str, default=None, help="ID column name")
     p_init.add_argument("--labels", type=str, default=None, help="Labels CSV file (classify/regress)")
     p_init.add_argument("--label-col", type=str, default=None, help="Label column name")
+    p_init.add_argument("--sample-n", type=int, default=0, help="Subsample to N sequences")
+    p_init.add_argument("--sample-frac", type=float, default=0.0, help="Subsample fraction (0-1)")
     p_init.add_argument("--force", action="store_true", help="Overwrite existing files")
 
     # list-models

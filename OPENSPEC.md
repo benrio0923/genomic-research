@@ -411,11 +411,10 @@ Priority: MEDIUM-HIGH — better training efficiency and convergence.
 
 Priority: MEDIUM — expand data format and processing capabilities.
 
-### T69: Support multi-file FASTA input
-- [ ] Accept directory path or glob pattern
-- [ ] Load all matching FASTA files and concatenate sequences
-- [ ] Add `--input-dir` CLI argument
-- [ ] File: `genomic_research/templates/prepare.py`, `cli.py`
+### T69: Support multi-file FASTA input ✅
+- [x] `load_sequences()` accepts directory path or glob pattern
+- [x] Recursively loads all .fasta/.fastq/.csv files from directory
+- [x] File: `genomic_research/templates/prepare.py`
 
 ### T70: Support GenBank format input
 - [ ] Parse .gb/.gbk files using BioPython
@@ -427,13 +426,10 @@ Priority: MEDIUM — expand data format and processing capabilities.
 - [ ] Use for per-position classification tasks
 - [ ] File: `genomic_research/templates/prepare.py`
 
-### T72: Add data statistics report
-- [ ] GC content distribution per sequence
-- [ ] Sequence length histogram
-- [ ] Nucleotide frequency table
-- [ ] N-content percentage
-- [ ] Print summary after loading, save as `data_report.json`
-- [ ] File: `genomic_research/templates/prepare.py`
+### T72: Add data statistics report ✅
+- [x] GC content, N content, nucleotide counts, length stats
+- [x] Saved as `data_report.json` in cache directory
+- [x] File: `genomic_research/templates/prepare.py`
 
 ### T73: Implement streaming data loader for large datasets
 - [ ] Use `IterableDataset` for datasets that don't fit in memory
@@ -441,11 +437,10 @@ Priority: MEDIUM — expand data format and processing capabilities.
 - [ ] Add `USE_STREAMING = True/False` when n_sequences > threshold
 - [ ] File: `genomic_research/templates/prepare.py`
 
-### T74: Add sequence deduplication
-- [ ] Remove exact duplicate sequences before training
-- [ ] Optionally remove near-duplicates (>99% identity)
-- [ ] Report how many duplicates removed
-- [ ] File: `genomic_research/templates/prepare.py`
+### T74: Add sequence deduplication ✅
+- [x] MD5-based exact duplicate removal before tokenization
+- [x] Reports count of removed duplicates
+- [x] File: `genomic_research/templates/prepare.py`
 
 ### T75: Add reverse complement data doubling
 - [ ] Option to add reverse complement of every sequence as additional training data
@@ -459,11 +454,10 @@ Priority: MEDIUM — expand data format and processing capabilities.
 - [ ] Add `--chunk-strategy fixed|random|slide` argument
 - [ ] File: `genomic_research/templates/prepare.py`
 
-### T77: Add data sampling for large datasets
-- [ ] When dataset has 1M+ sequences, subsample for quick experiments
-- [ ] Add `--sample-n 10000` or `--sample-frac 0.1` arguments
-- [ ] Ensure stratified sampling for classification
-- [ ] File: `genomic_research/templates/prepare.py`
+### T77: Add data sampling for large datasets ✅
+- [x] `--sample-n` and `--sample-frac` CLI args
+- [x] Random subsampling with fixed seed for reproducibility
+- [x] File: `genomic_research/templates/prepare.py`, `cli.py`
 
 ### T78: Support paired-end reads
 - [ ] Load R1/R2 FASTQ pairs

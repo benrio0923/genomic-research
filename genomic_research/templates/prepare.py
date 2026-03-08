@@ -56,10 +56,41 @@ def _clean_sequence(seq):
 def load_sequences(path, seq_col=None, id_col=None):
     """
     Load sequences from FASTA, FASTQ, or CSV.
+    Supports directory input (loads all sequence files) and glob patterns.
 
     Returns: list of (id, sequence) tuples.
     """
+    import glob as glob_mod
+
     path = str(path)
+
+    # Handle directory input — load all sequence files
+    if os.path.isdir(path):
+        all_seqs = []
+        exts = (".fasta", ".fa", ".fna", ".fastq", ".fq", ".csv")
+        files = sorted(f for f in os.listdir(path)
+                       if any(f.lower().endswith(e) for e in exts))
+        if not files:
+            raise ValueError(f"No sequence files found in directory: {path}")
+        print(f"  Found {len(files)} sequence files in {path}")
+        for fname in files:
+            fpath = os.path.join(path, fname)
+            seqs = load_sequences(fpath, seq_col=seq_col, id_col=id_col)
+            all_seqs.extend(seqs)
+        return all_seqs
+
+    # Handle glob patterns (e.g., "data/*.fasta")
+    if "*" in path or "?" in path:
+        matched = sorted(glob_mod.glob(path))
+        if not matched:
+            raise FileNotFoundError(f"No files matched pattern: {path}")
+        print(f"  Glob matched {len(matched)} files")
+        all_seqs = []
+        for fpath in matched:
+            seqs = load_sequences(fpath, seq_col=seq_col, id_col=id_col)
+            all_seqs.extend(seqs)
+        return all_seqs
+
     ext = Path(path).suffix.lower()
 
     if ext in (".fasta", ".fa", ".fna"):
@@ -360,6 +391,8 @@ def prepare_data(
     seq_col=None,
     id_col=None,
     bpe_vocab_size=4096,
+    sample_n=0,
+    sample_frac=0.0,
 ):
     """
     Prepare genomic data for training.
@@ -399,10 +432,58 @@ def prepare_data(
     if len(sequences) == 0:
         raise ValueError("No sequences found in input file.")
 
-    # Print sequence length stats
-    seq_lengths = [len(s) for _, s in sequences]
-    print(f"  Length range: {min(seq_lengths)} - {max(seq_lengths)} bp")
-    print(f"  Mean length: {np.mean(seq_lengths):.0f} bp")
+    # Subsample if requested (for quick experiments on large datasets)
+    if sample_n > 0 and sample_n < len(sequences):
+        rng = np.random.RandomState(RANDOM_SEED)
+        idx = rng.choice(len(sequences), size=sample_n, replace=False)
+        sequences = [sequences[i] for i in sorted(idx)]
+        print(f"  Subsampled to {len(sequences)} sequences (sample_n={sample_n})")
+    elif 0 < sample_frac < 1.0:
+        rng = np.random.RandomState(RANDOM_SEED)
+        n = max(1, int(len(sequences) * sample_frac))
+        idx = rng.choice(len(sequences), size=n, replace=False)
+        sequences = [sequences[i] for i in sorted(idx)]
+        print(f"  Subsampled to {len(sequences)} sequences (sample_frac={sample_frac})")
+
+    # Deduplicate sequences (exact matches)
+    seen_hashes = set()
+    unique_sequences = []
+    for sid, seq in sequences:
+        h = hashlib.md5(seq.encode()).hexdigest()
+        if h not in seen_hashes:
+            seen_hashes.add(h)
+            unique_sequences.append((sid, seq))
+    n_dupes = len(sequences) - len(unique_sequences)
+    if n_dupes > 0:
+        print(f"  Removed {n_dupes} exact duplicate sequences ({len(unique_sequences)} unique)")
+        sequences = unique_sequences
+
+    # Data statistics report
+    seq_lengths = np.array([len(s) for _, s in sequences])
+    all_concat = "".join(s for _, s in sequences)
+    total_bp = len(all_concat)
+    nuc_counts = {b: all_concat.count(b) for b in "ATCGN"}
+    gc_content = (nuc_counts["G"] + nuc_counts["C"]) / max(total_bp, 1)
+    n_content = nuc_counts["N"] / max(total_bp, 1)
+
+    print(f"  Length range: {seq_lengths.min()} - {seq_lengths.max()} bp")
+    print(f"  Mean length: {seq_lengths.mean():.0f} bp (median: {np.median(seq_lengths):.0f})")
+    print(f"  Total: {total_bp:,} bp | GC: {gc_content:.1%} | N: {n_content:.1%}")
+
+    # Save data report
+    data_report = {
+        "n_sequences": len(sequences),
+        "total_bp": total_bp,
+        "length_min": int(seq_lengths.min()),
+        "length_max": int(seq_lengths.max()),
+        "length_mean": float(seq_lengths.mean()),
+        "length_median": float(np.median(seq_lengths)),
+        "gc_content": round(gc_content, 4),
+        "n_content": round(n_content, 4),
+        "nucleotide_counts": nuc_counts,
+    }
+    with open(os.path.join(CACHE_DIR, "data_report.json"), "w") as f:
+        json.dump(data_report, f, indent=2)
 
     # Create tokenizer
     tokenizer = create_tokenizer(tokenizer_type, kmer_size, bpe_vocab_size)
@@ -1246,6 +1327,8 @@ if __name__ == "__main__":
     parser.add_argument("--labels", type=str, default=None, help="Path to labels CSV (classify/regress)")
     parser.add_argument("--label-col", type=str, default=None, help="Label column name")
     parser.add_argument("--bpe-vocab-size", type=int, default=4096, help="BPE vocabulary size (default: 4096)")
+    parser.add_argument("--sample-n", type=int, default=0, help="Subsample to N sequences (0 = no sampling)")
+    parser.add_argument("--sample-frac", type=float, default=0.0, help="Subsample fraction 0-1 (0 = no sampling)")
     args = parser.parse_args()
 
     seq_path = args.fasta or args.csv
@@ -1266,6 +1349,8 @@ if __name__ == "__main__":
         seq_col=args.seq_col,
         id_col=args.id_col,
         bpe_vocab_size=args.bpe_vocab_size,
+        sample_n=args.sample_n,
+        sample_frac=args.sample_frac,
     )
 
     print()
