@@ -380,6 +380,12 @@ def _chunk_tokens(token_ids, max_length, overlap_ratio=CHUNK_OVERLAP):
     return chunks
 
 
+def _reverse_complement(seq):
+    """Return the reverse complement of a DNA sequence."""
+    complement = str.maketrans("ATCGatcgNn", "TAGCtagcNn")
+    return seq.translate(complement)[::-1]
+
+
 def prepare_data(
     seq_path,
     task_type="pretrain",
@@ -393,6 +399,7 @@ def prepare_data(
     bpe_vocab_size=4096,
     sample_n=0,
     sample_frac=0.0,
+    rc_double=False,
 ):
     """
     Prepare genomic data for training.
@@ -457,6 +464,13 @@ def prepare_data(
     if n_dupes > 0:
         print(f"  Removed {n_dupes} exact duplicate sequences ({len(unique_sequences)} unique)")
         sequences = unique_sequences
+
+    # Reverse complement data doubling
+    if rc_double:
+        rc_seqs = [(f"{sid}_rc", _reverse_complement(seq)) for sid, seq in sequences]
+        n_before = len(sequences)
+        sequences = sequences + rc_seqs
+        print(f"  RC doubling: {n_before} → {len(sequences)} sequences")
 
     # Data statistics report
     seq_lengths = np.array([len(s) for _, s in sequences])
@@ -1104,6 +1118,42 @@ def generate_report(results, task_type, config, training_history=None,
         except (ImportError, Exception):
             pass
 
+    # --- Gradient norm plot ---
+    if training_history and "grad_norms" in training_history and training_history["grad_norms"]:
+        try:
+            gn_data = training_history["grad_norms"]
+            # Group norms by layer name prefix
+            layer_groups = {}
+            for entry in gn_data:
+                for name, norm in entry["norms"].items():
+                    # Simplify name to layer group
+                    parts = name.split(".")
+                    group = ".".join(parts[:3]) if len(parts) > 3 else name
+                    layer_groups.setdefault(group, {"steps": [], "norms": []})
+                    layer_groups[group]["steps"].append(entry["step"])
+                    layer_groups[group]["norms"].append(norm)
+
+            if layer_groups:
+                fig, ax = plt.subplots(figsize=(12, 6))
+                # Plot top 10 layer groups by mean norm
+                sorted_groups = sorted(layer_groups.items(),
+                                       key=lambda x: np.mean(x[1]["norms"]), reverse=True)
+                colors = plt.cm.tab10(np.linspace(0, 1, min(10, len(sorted_groups))))
+                for i, (group, data) in enumerate(sorted_groups[:10]):
+                    ax.plot(data["steps"], data["norms"], alpha=0.7, linewidth=1,
+                           color=colors[i], label=group)
+                ax.set_xlabel("Step")
+                ax.set_ylabel("Gradient L2 Norm")
+                ax.set_title("Per-Layer Gradient Norms")
+                ax.legend(fontsize=6, loc="upper right")
+                ax.set_yscale("log")
+                ax.grid(True, alpha=0.3)
+                fig.tight_layout()
+                fig.savefig(os.path.join(report_dir, "gradient_norms.png"), dpi=150)
+                plt.close(fig)
+        except Exception:
+            pass
+
     # --- Save metrics JSON ---
     metrics_to_save = {k: v for k, v in results.items()
                        if k not in ("predictions", "targets", "probabilities")}
@@ -1329,6 +1379,7 @@ if __name__ == "__main__":
     parser.add_argument("--bpe-vocab-size", type=int, default=4096, help="BPE vocabulary size (default: 4096)")
     parser.add_argument("--sample-n", type=int, default=0, help="Subsample to N sequences (0 = no sampling)")
     parser.add_argument("--sample-frac", type=float, default=0.0, help="Subsample fraction 0-1 (0 = no sampling)")
+    parser.add_argument("--rc-double", action="store_true", help="Double dataset with reverse complement sequences")
     args = parser.parse_args()
 
     seq_path = args.fasta or args.csv
@@ -1351,6 +1402,7 @@ if __name__ == "__main__":
         bpe_vocab_size=args.bpe_vocab_size,
         sample_n=args.sample_n,
         sample_frac=args.sample_frac,
+        rc_double=args.rc_double,
     )
 
     print()

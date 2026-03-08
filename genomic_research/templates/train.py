@@ -12,12 +12,24 @@ import math
 import os
 import random
 import signal
+import sys
 import time
 
 import numpy as np
 
 import torch
 import torch.nn as nn
+
+# ---------------------------------------------------------------------------
+# Terminal color helpers (ANSI escape codes, no external dependency)
+# ---------------------------------------------------------------------------
+_USE_COLOR = sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
+
+def _green(s): return f"\033[32m{s}\033[0m" if _USE_COLOR else str(s)
+def _red(s): return f"\033[31m{s}\033[0m" if _USE_COLOR else str(s)
+def _yellow(s): return f"\033[33m{s}\033[0m" if _USE_COLOR else str(s)
+def _bold(s): return f"\033[1m{s}\033[0m" if _USE_COLOR else str(s)
+def _cyan(s): return f"\033[36m{s}\033[0m" if _USE_COLOR else str(s)
 
 # Graceful shutdown on SIGINT/SIGTERM
 _interrupted = False
@@ -55,6 +67,8 @@ if _config_path and os.path.exists(_config_path):
         with open(_config_path) as _f:
             _CONFIG_OVERRIDES = json.load(_f)
         print(f"Config loaded from {_config_path} (JSON)")
+
+_DRY_RUN = "--dry-run" in sys.argv
 
 def _cfg(key, default):
     """Get config value with override support."""
@@ -98,6 +112,13 @@ MAMBA_EXPAND = _cfg("mamba_expand", 2)
 USE_RC_AUGMENT = False         # reverse complement augmentation (50% chance)
 USE_SPAN_MASKING = False       # span masking instead of random token masking
 SPAN_MEAN_LENGTH = 3           # mean span length for span masking
+USE_SNP_NOISE = _cfg("use_snp_noise", False)   # random base substitution noise
+SNP_RATE = _cfg("snp_rate", 0.01)              # fraction of tokens to substitute
+USE_INDEL_NOISE = _cfg("use_indel_noise", False)  # random insertion/deletion noise
+INDEL_RATE = _cfg("indel_rate", 0.005)            # fraction of tokens for indels
+USE_RANDOM_CROP = _cfg("use_random_crop", False)  # random subsequence cropping
+MIN_CROP_RATIO = _cfg("min_crop_ratio", 0.5)      # minimum crop length ratio
+TOKEN_DROPOUT = _cfg("token_dropout", 0.0)         # randomly drop tokens (replace with PAD)
 
 # --- Training infrastructure ---
 USE_AMP = True                 # automatic mixed precision (CUDA only)
@@ -176,6 +197,80 @@ def span_mask_tokens(tokens, mask, mask_ratio, span_mean_length, mask_token_id, 
         labels[i, ~masked] = PAD_TOKEN_ID
 
     return input_ids, labels
+
+
+def snp_noise(tokens, mask, rate, num_special):
+    """Randomly substitute bases to simulate sequencing errors (SNP noise)."""
+    out = tokens.clone()
+    valid = (mask == 1) & (tokens >= num_special)
+    noise_mask = valid & (torch.rand_like(tokens.float()) < rate)
+    # Replace with random valid token (num_special to num_special+3 = A,T,C,G range)
+    random_tokens = torch.randint(num_special, num_special + 4, tokens.shape,
+                                  device=tokens.device, dtype=tokens.dtype)
+    out[noise_mask] = random_tokens[noise_mask]
+    return out
+
+
+def indel_noise(tokens, mask, rate, pad_id, num_special):
+    """Randomly insert or delete tokens to simulate indel errors."""
+    B, L = tokens.shape
+    out = tokens.clone()
+    out_mask = mask.clone()
+    for i in range(B):
+        seq_len = mask[i].sum().item()
+        if seq_len < 4:
+            continue
+        valid_positions = ((mask[i] == 1) & (tokens[i] >= num_special)).nonzero(as_tuple=True)[0]
+        if len(valid_positions) == 0:
+            continue
+        n_indels = max(1, int(len(valid_positions) * rate))
+        for _ in range(n_indels):
+            pos = valid_positions[torch.randint(len(valid_positions), (1,))].item()
+            if torch.rand(1).item() < 0.5:
+                # Deletion: shift left
+                if pos < L - 1:
+                    out[i, pos:-1] = out[i, pos + 1:].clone()
+                    out[i, -1] = pad_id
+                    out_mask[i, pos:-1] = out_mask[i, pos + 1:].clone()
+                    out_mask[i, -1] = 0
+            else:
+                # Insertion: shift right (insert random base)
+                if pos < L - 1:
+                    out[i, pos + 1:] = out[i, pos:-1].clone()
+                    out_mask[i, pos + 1:] = out_mask[i, pos:-1].clone()
+                    out[i, pos] = torch.randint(num_special, num_special + 4, (1,),
+                                                device=tokens.device, dtype=tokens.dtype).item()
+    return out, out_mask
+
+
+def random_crop(tokens, mask, min_ratio, pad_id):
+    """Randomly crop a contiguous subsequence from each sequence."""
+    B, L = tokens.shape
+    out = tokens.clone()
+    out_mask = mask.clone()
+    for i in range(B):
+        seq_len = int(mask[i].sum().item())
+        if seq_len < 4:
+            continue
+        crop_len = max(2, int(seq_len * (min_ratio + (1 - min_ratio) * torch.rand(1).item())))
+        start = torch.randint(0, max(1, seq_len - crop_len + 1), (1,)).item()
+        # Copy cropped region to beginning, pad rest
+        out[i, :crop_len] = tokens[i, start:start + crop_len]
+        out[i, crop_len:] = pad_id
+        out_mask[i, :crop_len] = mask[i, start:start + crop_len]
+        out_mask[i, crop_len:] = 0
+    return out, out_mask
+
+
+def token_dropout_aug(tokens, mask, drop_rate, pad_id, num_special):
+    """Randomly drop tokens by replacing with PAD (no prediction target)."""
+    out = tokens.clone()
+    out_mask = mask.clone()
+    valid = (mask == 1) & (tokens >= num_special)
+    drop_mask = valid & (torch.rand_like(tokens.float()) < drop_rate)
+    out[drop_mask] = pad_id
+    out_mask[drop_mask] = 0
+    return out, out_mask
 
 
 # ---------------------------------------------------------------------------
@@ -933,7 +1028,26 @@ if __name__ == "__main__":
         print(f"Model EMA: decay={EMA_DECAY}")
 
     num_params = sum(p.numel() for p in model.parameters())
-    print(f"Parameters: {num_params:,}")
+    print(f"Parameters: {_cyan(f'{num_params:,}')}")
+
+    # --dry-run: print model info and exit without training
+    if _DRY_RUN:
+        print(f"\n{_bold('=== DRY RUN ===')} (no training)")
+        print(f"Model:      {MODEL_TYPE}")
+        print(f"Layers:     {N_LAYERS}")
+        print(f"d_model:    {D_MODEL}")
+        print(f"d_ff:       {D_FF}")
+        print(f"Heads:      {N_HEADS}")
+        print(f"Params:     {num_params:,}")
+        print(f"Objective:  {OBJECTIVE}")
+        print(f"LR:         {LEARNING_RATE}")
+        print(f"Batch:      {BATCH_SIZE}")
+        print(f"Schedule:   {LR_SCHEDULE}")
+        print(f"Time budget: {TIME_BUDGET}s")
+        # Estimate memory (rough: 4 bytes per param * 3 for activations/gradients)
+        _est_mem_mb = num_params * 4 * 3 / 1024 / 1024
+        print(f"Est. memory: ~{_est_mem_mb:.0f} MB (fp32, rough estimate)")
+        sys.exit(0)
 
     # Build parameter groups with optional layer-wise LR decay
     def _get_param_groups(model, lr, wd, layer_decay):
@@ -1085,6 +1199,7 @@ if __name__ == "__main__":
         "steps": [], "losses": [], "lrs": [],
         "eval_steps": [], "eval_scores": [],
         "eval_perplexities": [], "eval_token_accuracies": [],
+        "grad_norms": [],  # per-layer gradient norms for diagnostics
     }
 
     eval_interval_seconds = max(TIME_BUDGET * 0.2, 10)
@@ -1112,6 +1227,13 @@ if __name__ == "__main__":
                     mask_batch = mask_batch.to(device)
                     labels_batch = labels_batch.to(device)
 
+                    # Data augmentation for classify/regress
+                    if USE_SNP_NOISE and SNP_RATE > 0:
+                        tokens_batch = snp_noise(tokens_batch, mask_batch, SNP_RATE, NUM_SPECIAL)
+                    if TOKEN_DROPOUT > 0:
+                        tokens_batch, mask_batch = token_dropout_aug(
+                            tokens_batch, mask_batch, TOKEN_DROPOUT, PAD_TOKEN_ID, NUM_SPECIAL)
+
                     with torch.amp.autocast(amp_device, enabled=amp_enabled, dtype=amp_dtype):
                         output = model(tokens_batch, attention_mask=mask_batch)
                         if task_type == "regress":
@@ -1126,6 +1248,25 @@ if __name__ == "__main__":
                     # Reverse complement augmentation (50% chance per batch)
                     if USE_RC_AUGMENT and torch.rand(1).item() < 0.5:
                         tokens_batch = reverse_complement_tokens(tokens_batch, mask_batch)
+
+                    # Data augmentation: SNP noise
+                    if USE_SNP_NOISE and SNP_RATE > 0:
+                        tokens_batch = snp_noise(tokens_batch, mask_batch, SNP_RATE, NUM_SPECIAL)
+
+                    # Data augmentation: indel noise
+                    if USE_INDEL_NOISE and INDEL_RATE > 0:
+                        tokens_batch, mask_batch = indel_noise(
+                            tokens_batch, mask_batch, INDEL_RATE, PAD_TOKEN_ID, NUM_SPECIAL)
+
+                    # Data augmentation: random subsequence cropping
+                    if USE_RANDOM_CROP:
+                        tokens_batch, mask_batch = random_crop(
+                            tokens_batch, mask_batch, MIN_CROP_RATIO, PAD_TOKEN_ID)
+
+                    # Data augmentation: token dropout
+                    if TOKEN_DROPOUT > 0:
+                        tokens_batch, mask_batch = token_dropout_aug(
+                            tokens_batch, mask_batch, TOKEN_DROPOUT, PAD_TOKEN_ID, NUM_SPECIAL)
 
                     if OBJECTIVE == "mlm":
                         if USE_SPAN_MASKING:
@@ -1181,6 +1322,16 @@ if __name__ == "__main__":
                 if _is_accum_boundary:
                     if scaler is not None:
                         scaler.unscale_(optimizer)
+
+                    # Track per-layer gradient norms (every 200 steps)
+                    if step % 200 == 0:
+                        _gnorms = {}
+                        for name, p in model.named_parameters():
+                            if p.grad is not None:
+                                _gnorms[name] = p.grad.data.norm(2).item()
+                        history["grad_norms"].append({"step": step, "norms": _gnorms})
+
+                    if scaler is not None:
                         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                         scaler.step(optimizer)
                         scaler.update()
@@ -1256,7 +1407,7 @@ if __name__ == "__main__":
                 else:
                     _evals_without_improvement += 1
                     if EARLY_STOP_PATIENCE > 0 and _evals_without_improvement >= EARLY_STOP_PATIENCE:
-                        print(f"\nEarly stopping: no improvement for {EARLY_STOP_PATIENCE} evaluations")
+                        print(_yellow(f"\nEarly stopping: no improvement for {EARLY_STOP_PATIENCE} evaluations"))
                         _interrupted = True
                 model.train()
                 last_eval_time = total_training_time
@@ -1311,7 +1462,7 @@ if __name__ == "__main__":
             device=device, mask_ratio=MASK_RATIO,
         )
         if ema_results["val_score"] > results["val_score"]:
-            print(f"EMA improved val_score: {results['val_score']:.6f} → {ema_results['val_score']:.6f}")
+            print(_green(f"EMA improved val_score: {results['val_score']:.6f} → {ema_results['val_score']:.6f}"))
             model.load_state_dict(ema.state_dict())
             results = ema_results
 
@@ -1334,7 +1485,7 @@ if __name__ == "__main__":
             device=device, mask_ratio=MASK_RATIO,
         )
         if swa_results["val_score"] > results["val_score"]:
-            print(f"SWA improved val_score: {results['val_score']:.6f} → {swa_results['val_score']:.6f} ({swa_n} snapshots)")
+            print(_green(f"SWA improved val_score: {results['val_score']:.6f} → {swa_results['val_score']:.6f} ({swa_n} snapshots)"))
             # Extract the inner module weights from AveragedModel
             model.load_state_dict(swa_model.module.state_dict())
             results = swa_results
@@ -1353,7 +1504,8 @@ if __name__ == "__main__":
     print("---")
     print(f"task_type:        {task_type}")
     print(f"objective:        {OBJECTIVE}")
-    print(f"val_score:        {results['val_score']:.6f}")
+    _vs = results['val_score']
+    print(f"{_bold('val_score')}:        {_bold(f'{_vs:.6f}')}")
 
     if task_type == "pretrain":
         print(f"val_perplexity:   {results.get('val_perplexity', 0):.4f}")
@@ -1382,7 +1534,7 @@ if __name__ == "__main__":
     print(f"peak_vram_mb:     {peak_vram_mb:.1f}")
     print(f"num_steps:        {step}")
     print(f"num_epochs:       {epoch}")
-    print(f"num_params:       {num_params:,}")
+    print(f"num_params:       {_cyan(f'{num_params:,}')}")
     print(f"model_type:       {MODEL_TYPE}")
     print(f"device:           {device}")
 

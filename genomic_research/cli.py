@@ -99,6 +99,8 @@ def cmd_init(args):
         prepare_cmd.extend(["--sample-n", str(args.sample_n)])
     if args.sample_frac > 0:
         prepare_cmd.extend(["--sample-frac", str(args.sample_frac)])
+    if args.rc_double:
+        prepare_cmd.append("--rc-double")
 
     result = subprocess.run(prepare_cmd, cwd=cwd)
     if result.returncode != 0:
@@ -272,6 +274,7 @@ def main():
     p_init.add_argument("--label-col", type=str, default=None, help="Label column name")
     p_init.add_argument("--sample-n", type=int, default=0, help="Subsample to N sequences")
     p_init.add_argument("--sample-frac", type=float, default=0.0, help="Subsample fraction (0-1)")
+    p_init.add_argument("--rc-double", action="store_true", help="Double dataset with reverse complement")
     p_init.add_argument("--force", action="store_true", help="Overwrite existing files")
 
     # list-models
