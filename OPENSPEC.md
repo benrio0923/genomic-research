@@ -88,10 +88,10 @@ Priority: HIGH — comprehensive test coverage.
 - [x] Verify: prepare → train → reports with confusion matrix
 - [x] File: `tests/test_smoke.py`
 
-### T14: Test regression end-to-end
-- [ ] Add `TestEndToEnd.test_regress_e2e` using synthetic CSV with float labels
-- [ ] Verify: prepare → train → reports with predicted_vs_actual
-- [ ] File: `tests/test_smoke.py`
+### T14: Test regression end-to-end ✅
+- [x] Add `TestEndToEnd.test_regress_e2e` using synthetic CSV with float labels
+- [x] Verify: prepare → train → reports with predicted_vs_actual
+- [x] File: `tests/test_smoke.py`
 
 ### T15: Test CLM objective ✅
 - [x] Add test for causal language modeling objective
@@ -110,18 +110,18 @@ Priority: HIGH — comprehensive test coverage.
 - [x] Test: extract embeddings, verify shape
 - [x] File: `tests/test_smoke.py`
 
-### T18: Test CLI commands
-- [ ] Add `TestCLI` class
-- [ ] Test: `genomic-research list-models` outputs all architectures
-- [ ] Test: `genomic-research status` when no cache exists
-- [ ] Test: `genomic-research clean` removes cache
-- [ ] File: `tests/test_smoke.py`
+### T18: Test CLI commands ✅
+- [x] Add `TestCLI` class
+- [x] Test: `genomic-research list-models` outputs all architectures
+- [x] Test: `genomic-research status` when no cache exists
+- [x] Test: `genomic-research clean` removes cache
+- [x] File: `tests/test_smoke.py`
 
-### T19: Test config override system
-- [ ] Create test JSON config with custom hyperparameters
-- [ ] Verify `_cfg()` correctly returns overridden values
-- [ ] Verify non-overridden values use defaults
-- [ ] File: `tests/test_smoke.py`
+### T19: Test config override system ✅
+- [x] Create test JSON config with custom hyperparameters
+- [x] Verify `_cfg()` correctly returns overridden values
+- [x] Verify non-overridden values use defaults
+- [x] File: `tests/test_smoke.py`
 
 ### T20: Test data augmentation functions ✅
 - [x] Test `reverse_complement_tokens` with known inputs
@@ -129,15 +129,15 @@ Priority: HIGH — comprehensive test coverage.
 - [x] Verify augmentation doesn't corrupt PAD tokens
 - [x] File: `tests/test_smoke.py`
 
-### T21: Test checkpoint save/load roundtrip
-- [ ] Save model → load model → verify outputs match
-- [ ] Test with each architecture (transformer, cnn, lstm)
-- [ ] File: `tests/test_smoke.py`
+### T21: Test checkpoint save/load roundtrip ✅
+- [x] Save model → load model → verify outputs match
+- [x] Test with each architecture (transformer, cnn, lstm)
+- [x] File: `tests/test_smoke.py`
 
-### T22: Test FASTQ quality filtering
-- [ ] Generate synthetic FASTQ with quality scores
-- [ ] Verify low-quality sequences are filtered
-- [ ] File: `tests/test_smoke.py`
+### T22: Test FASTQ quality filtering ✅
+- [x] Generate synthetic FASTQ with quality scores
+- [x] Verify low-quality sequences are filtered
+- [x] File: `tests/test_smoke.py`
 
 ### T23: Test long sequence chunking ✅
 - [x] Create sequence longer than max_length
@@ -145,15 +145,15 @@ Priority: HIGH — comprehensive test coverage.
 - [x] Verify chunk boundaries are correct
 - [x] File: `tests/test_smoke.py`
 
-### T24: Test stratified split for classification
-- [ ] Create imbalanced dataset (class A: 100, class B: 10, class C: 5)
-- [ ] Verify each class appears in both train and val sets
-- [ ] File: `tests/test_smoke.py`
+### T24: Test stratified split for classification ✅
+- [x] Create imbalanced dataset (class A: 100, class B: 10, class C: 5)
+- [x] Verify each class appears in both train and val sets
+- [x] File: `tests/test_smoke.py`
 
-### T25: Test class weights computation
-- [ ] Verify weights are inversely proportional to class frequency
-- [ ] Verify weights sum to n_classes (approximately)
-- [ ] File: `tests/test_smoke.py`
+### T25: Test class weights computation ✅
+- [x] Verify weights are inversely proportional to class frequency
+- [x] Verify weights sum to n_classes (approximately)
+- [x] File: `tests/test_smoke.py`
 
 ### T26: Test report generation ✅
 - [x] Verify all expected files are created for pretrain task
@@ -161,16 +161,16 @@ Priority: HIGH — comprehensive test coverage.
 - [x] Verify metrics.json contains all expected fields
 - [x] File: `tests/test_smoke.py`
 
-### T27: Add property-based tests for tokenizers
-- [ ] Use hypothesis library to generate random sequences
-- [ ] Property: `decode(encode(seq)) == seq` for all valid sequences
-- [ ] Property: `len(encode(seq)) > 0` for non-empty sequences
-- [ ] File: `tests/test_properties.py` (new)
+### T27: Add property-based tests for tokenizers ✅
+- [x] Use hypothesis library to generate random sequences
+- [x] Property: `decode(encode(seq)) == seq` for all valid sequences
+- [x] Property: `len(encode(seq)) > 0` for non-empty sequences
+- [x] File: `tests/test_properties.py` (new)
 
-### T28: Test multi-file input
-- [ ] Create multiple FASTA files
-- [ ] Test glob pattern input (if supported) or concatenation
-- [ ] File: `tests/test_smoke.py`
+### T28: Test multi-file input ✅
+- [x] Create multiple FASTA files
+- [x] Test glob pattern input (if supported) or concatenation
+- [x] File: `tests/test_smoke.py`
 
 ### T29: Test edge cases ✅
 - [x] Single sequence dataset
@@ -180,10 +180,10 @@ Priority: HIGH — comprehensive test coverage.
 - [x] CSV with missing values
 - [x] File: `tests/test_edge_cases.py` (new)
 
-### T30: Add benchmark tests
-- [ ] Test that training doesn't regress in speed (tokens/sec baseline)
-- [ ] Test memory usage doesn't exceed expected bounds
-- [ ] File: `tests/test_benchmark.py` (new)
+### T30: Add benchmark tests ✅
+- [x] Test that training doesn't regress in speed (tokens/sec baseline)
+- [x] Test memory usage doesn't exceed expected bounds
+- [x] File: `tests/test_benchmark.py` (new)
 
 ---
 

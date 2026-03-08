@@ -844,6 +844,61 @@ class TestMultiFileInput:
         assert len(seqs) == 30, f"Expected 30 sequences from 3 files, got {len(seqs)}"
 
 
+class TestBenchmarks:
+    """T30: Benchmark tests measuring performance baselines."""
+
+    def test_tokenizer_speed(self):
+        """Benchmark tokenizer encoding speed."""
+        import time
+        import random
+        random.seed(42)
+        sys.path.insert(0, str(Path(__file__).parent.parent / "genomic_research" / "templates"))
+        from prepare import CharTokenizer, KmerTokenizer
+
+        seq = "".join(random.choice("ATCG") for _ in range(10000))
+
+        # CharTokenizer benchmark
+        tok = CharTokenizer()
+        start = time.perf_counter()
+        for _ in range(100):
+            tok.encode(seq)
+        char_time = time.perf_counter() - start
+        assert char_time < 10.0, f"CharTokenizer too slow: {char_time:.2f}s for 100x10kb"
+
+        # KmerTokenizer benchmark
+        tok_k = KmerTokenizer(k=6)
+        start = time.perf_counter()
+        for _ in range(100):
+            tok_k.encode(seq)
+        kmer_time = time.perf_counter() - start
+        assert kmer_time < 10.0, f"KmerTokenizer too slow: {kmer_time:.2f}s for 100x10kb"
+
+    def test_model_forward_speed(self):
+        """Benchmark model forward pass speed."""
+        import time
+        sys.path.insert(0, str(Path(__file__).parent.parent / "genomic_research" / "templates"))
+        import torch
+        from train import build_model
+
+        model = build_model("transformer", vocab_size=10, d_model=64, n_heads=4,
+                           d_ff=128, n_layers=2, max_len=128, dropout=0.0,
+                           task_type="pretrain")
+        model.eval()
+        tokens = torch.randint(5, 10, (8, 128))
+        mask = torch.ones(8, 128, dtype=torch.long)
+
+        # Warmup
+        with torch.no_grad():
+            model(tokens, attention_mask=mask)
+
+        start = time.perf_counter()
+        with torch.no_grad():
+            for _ in range(20):
+                model(tokens, attention_mask=mask)
+        elapsed = time.perf_counter() - start
+        assert elapsed < 30.0, f"Forward pass too slow: {elapsed:.2f}s for 20 iterations"
+
+
 class TestEdgeCases:
     """Test edge cases and error handling."""
 
