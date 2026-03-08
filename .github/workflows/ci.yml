@@ -27,6 +27,13 @@ jobs:
           pip install -e .
           pip install pytest
 
+      - name: Validate pip install (T144)
+        run: |
+          pip install . --force-reinstall --no-deps
+          genomic-research --help
+          python -c "import genomic_research; print('Import OK')"
+          python -c "from genomic_research.cli import main; print('CLI entry OK')"
+
       - name: Run smoke tests
         run: |
           pytest tests/test_smoke.py -v --tb=short -x

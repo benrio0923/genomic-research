@@ -1678,6 +1678,18 @@ def cmd_archive(args):
         print(f"    {f}")
 
 
+def cmd_serve(args):
+    """Start FastAPI inference server (T139)."""
+    from genomic_research.serve import run_server
+    run_server(checkpoint=args.checkpoint, host=args.host, port=args.port)
+
+
+def cmd_demo(args):
+    """Launch Gradio demo interface (T140)."""
+    from genomic_research.demo import launch_demo
+    launch_demo(checkpoint=args.checkpoint, port=args.port, share=args.share)
+
+
 def main():
     parser = argparse.ArgumentParser(
         prog="genomic-research",
@@ -1845,6 +1857,20 @@ def main():
     p_archive = subparsers.add_parser("archive", help="Archive experiment as tar.gz")
     p_archive.add_argument("--name", type=str, default=None, help="Archive name (default: auto-generated)")
 
+    # serve (T139)
+    p_serve = subparsers.add_parser("serve", help="Start FastAPI inference server")
+    p_serve.add_argument("--checkpoint", type=str, default="checkpoints/best_model.pt",
+                         help="Path to model checkpoint")
+    p_serve.add_argument("--host", type=str, default="0.0.0.0", help="Server host (default: 0.0.0.0)")
+    p_serve.add_argument("--port", type=int, default=8000, help="Server port (default: 8000)")
+
+    # demo (T140)
+    p_demo = subparsers.add_parser("demo", help="Launch Gradio demo interface")
+    p_demo.add_argument("--checkpoint", type=str, default="checkpoints/best_model.pt",
+                        help="Path to model checkpoint")
+    p_demo.add_argument("--port", type=int, default=7860, help="Server port (default: 7860)")
+    p_demo.add_argument("--share", action="store_true", help="Create public Gradio link")
+
     args = parser.parse_args()
 
     if args.command == "init":
@@ -1895,6 +1921,10 @@ def main():
         cmd_best_model(args)
     elif args.command == "experiment-diff":
         cmd_experiment_diff(args)
+    elif args.command == "serve":
+        cmd_serve(args)
+    elif args.command == "demo":
+        cmd_demo(args)
     else:
         parser.print_help()
 
