@@ -110,13 +110,49 @@ def load_sequences(path, seq_col=None, id_col=None):
 
 
 def _load_fasta(path):
-    """Load sequences from FASTA file using BioPython."""
+    """Load sequences from FASTA file. Uses fast manual parser for large files (T171)."""
+    file_size = os.path.getsize(path)
+
+    # For large files (>50MB), use fast manual parser to avoid BioPython overhead
+    if file_size > 50 * 1024 * 1024:
+        return _load_fasta_fast(path)
+
     from Bio import SeqIO
     sequences = []
     for record in SeqIO.parse(path, "fasta"):
         seq = _clean_sequence(str(record.seq))
         if len(seq) > 0:
             sequences.append((record.id, seq))
+    return sequences
+
+
+def _load_fasta_fast(path):
+    """Fast FASTA parser for large files — avoids BioPython overhead (T171)."""
+    sequences = []
+    current_id = None
+    current_seq = []
+
+    with open(path, "r", buffering=8 * 1024 * 1024) as f:  # 8MB buffer
+        for line in f:
+            line = line.rstrip()
+            if not line:
+                continue
+            if line[0] == ">":
+                if current_id is not None and current_seq:
+                    seq = _clean_sequence("".join(current_seq))
+                    if len(seq) > 0:
+                        sequences.append((current_id, seq))
+                current_id = line[1:].split()[0]
+                current_seq = []
+            else:
+                current_seq.append(line)
+
+    # Last record
+    if current_id is not None and current_seq:
+        seq = _clean_sequence("".join(current_seq))
+        if len(seq) > 0:
+            sequences.append((current_id, seq))
+
     return sequences
 
 
@@ -1116,6 +1152,27 @@ def prepare_data(
     """
     os.makedirs(CACHE_DIR, exist_ok=True)
 
+    # Cache validation — skip re-processing if data hasn't changed (T177)
+    import hashlib as _hashlib
+    _cache_key_parts = [
+        seq_path, task_type, tokenizer_type, str(kmer_size), str(max_length),
+        str(labels_path or ""), str(label_col or ""), str(bpe_vocab_size),
+    ]
+    # Include file modification time + size in cache key (fast, avoids reading entire file)
+    if os.path.exists(seq_path):
+        _st = os.stat(seq_path)
+        _cache_key_parts.extend([str(_st.st_size), str(int(_st.st_mtime))])
+    _cache_hash = _hashlib.md5("|".join(_cache_key_parts).encode()).hexdigest()[:12]
+    _cache_marker = os.path.join(CACHE_DIR, ".cache_hash")
+    if os.path.exists(_cache_marker):
+        with open(_cache_marker) as _f:
+            if _f.read().strip() == _cache_hash:
+                # All cached files still valid
+                _required = ["train_tokens.pt", "val_tokens.pt", "task_config.json"]
+                if all(os.path.exists(os.path.join(CACHE_DIR, f)) for f in _required):
+                    print(f"Cache hit ({_cache_hash}) — skipping data preparation")
+                    return
+
     # Input validation
     if not os.path.exists(seq_path):
         raise FileNotFoundError(f"Input file not found: {seq_path}")
@@ -1205,12 +1262,23 @@ def prepare_data(
         print(f"Training BPE tokenizer (vocab_size={bpe_vocab_size})...")
         tokenizer.train([s for _, s in sequences], vocab_size=bpe_vocab_size)
 
-    # Tokenize sequences
+    # Tokenize sequences — use batch processing for large datasets (T172)
     print(f"Tokenizing with {tokenizer_type} (vocab_size={tokenizer.vocab_size})...")
     tokenized = []
-    for sid, seq in sequences:
-        tokens = tokenizer.encode(seq)
-        tokenized.append((sid, tokens))
+    if len(sequences) > 5000 and tokenizer_type != "bpe":
+        # Batch tokenization for performance
+        batch_size = 1000
+        for start in range(0, len(sequences), batch_size):
+            batch = sequences[start:start + batch_size]
+            for sid, seq in batch:
+                tokens = tokenizer.encode(seq)
+                tokenized.append((sid, tokens))
+            if start > 0 and start % 10000 == 0:
+                print(f"  Tokenized {start}/{len(sequences)} sequences...")
+    else:
+        for sid, seq in sequences:
+            tokens = tokenizer.encode(seq)
+            tokenized.append((sid, tokens))
 
     # Load labels if needed
     labels_map = {}
@@ -1437,6 +1505,10 @@ def prepare_data(
     if task_type == "classify":
         print(f"Classes:        {n_classes} ({', '.join(target_names[:5])}{'...' if len(target_names) > 5 else ''})")
     print(f"Saved to:       {CACHE_DIR}")
+
+    # Write cache hash for future validation (T177)
+    with open(_cache_marker, "w") as _f:
+        _f.write(_cache_hash)
 
     return config
 
