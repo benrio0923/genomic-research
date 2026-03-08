@@ -168,6 +168,8 @@ USE_DISTILLATION = _cfg("use_distillation", False)              # knowledge dist
 TEACHER_CHECKPOINT = _cfg("teacher_checkpoint", "")             # path to teacher checkpoint (.pt)
 DISTILL_ALPHA = _cfg("distill_alpha", 0.5)                      # weight for distillation loss (vs task loss)
 DISTILL_TEMP = _cfg("distill_temp", 2.0)                        # temperature for soft targets
+AUX_LOSSES = _cfg("aux_losses", [])                             # auxiliary losses: ["contrastive", "denoise", "clm"]
+AUX_LOSS_WEIGHT = _cfg("aux_loss_weight", 0.1)                  # weight for each auxiliary loss
 
 # ---------------------------------------------------------------------------
 # Data augmentation utilities
@@ -1694,6 +1696,340 @@ class GenomicMultiScaleCNN(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# Reformer (LSH Attention)
+# ---------------------------------------------------------------------------
+
+class LSHAttention(nn.Module):
+    """Locality-Sensitive Hashing attention for O(n log n) approximate attention."""
+
+    def __init__(self, d_model, n_heads, n_hashes=4, bucket_size=32):
+        super().__init__()
+        self.n_heads = n_heads
+        self.head_dim = d_model // n_heads
+        self.n_hashes = n_hashes
+        self.bucket_size = bucket_size
+        self.qk_proj = nn.Linear(d_model, d_model)
+        self.v_proj = nn.Linear(d_model, d_model)
+        self.out_proj = nn.Linear(d_model, d_model)
+
+    def _hash_vectors(self, x, n_buckets):
+        """Random projection hashing: project onto random vectors and take sign."""
+        B, L, D = x.shape
+        # Random rotation matrix (fixed per forward, varies per hash round)
+        rand_matrix = torch.randn(D, self.n_hashes * n_buckets // 2, device=x.device)
+        rotated = x @ rand_matrix  # (B, L, n_hashes * n_buckets//2)
+        # Concatenate with negation for symmetric hashing
+        rotated = torch.cat([rotated, -rotated], dim=-1)  # (B, L, n_hashes * n_buckets)
+        rotated = rotated.view(B, L, self.n_hashes, n_buckets)
+        # Argmax gives bucket assignment
+        buckets = rotated.argmax(dim=-1)  # (B, L, n_hashes)
+        return buckets
+
+    def forward(self, x, attention_mask=None):
+        B, L, D = x.shape
+        qk = self.qk_proj(x)
+        v = self.v_proj(x)
+
+        # Reshape for multi-head
+        qk = qk.view(B, L, self.n_heads, self.head_dim)
+        v = v.view(B, L, self.n_heads, self.head_dim)
+
+        # L2 normalize qk for cosine similarity
+        qk_norm = nn.functional.normalize(qk, dim=-1)
+
+        # For short sequences, fall back to standard attention
+        if L <= self.bucket_size * 4:
+            scale = self.head_dim ** -0.5
+            attn = torch.einsum("blhd,bmhd->bhlm", qk_norm, qk_norm) * scale
+            if attention_mask is not None:
+                pad_mask = (attention_mask == 0).unsqueeze(1).unsqueeze(2)
+                attn = attn.masked_fill(pad_mask, float("-inf"))
+            attn = torch.softmax(attn, dim=-1)
+            out = torch.einsum("bhlm,bmhd->blhd", attn, v)
+        else:
+            # LSH bucketing + sorted attention
+            n_buckets = max(1, L // self.bucket_size)
+            buckets = self._hash_vectors(qk_norm.mean(dim=2), n_buckets)  # (B, L, n_hashes)
+
+            # Use first hash round for sorting, apply standard attention within buckets
+            sort_idx = buckets[:, :, 0].argsort(dim=1)
+            unsort_idx = sort_idx.argsort(dim=1)
+
+            # Sort qk and v
+            sort_exp = sort_idx.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, self.n_heads, self.head_dim)
+            qk_sorted = qk_norm.gather(1, sort_exp)
+            v_sorted = v.gather(1, sort_exp)
+
+            # Chunk into buckets and apply local attention
+            chunk_size = max(self.bucket_size, 1)
+            n_chunks = max(1, L // chunk_size)
+            pad_len = n_chunks * chunk_size - L
+            if pad_len > 0:
+                qk_sorted = nn.functional.pad(qk_sorted, (0, 0, 0, 0, 0, pad_len))
+                v_sorted = nn.functional.pad(v_sorted, (0, 0, 0, 0, 0, pad_len))
+
+            qk_chunks = qk_sorted.view(B, n_chunks, chunk_size, self.n_heads, self.head_dim)
+            v_chunks = v_sorted.view(B, n_chunks, chunk_size, self.n_heads, self.head_dim)
+
+            scale = self.head_dim ** -0.5
+            attn = torch.einsum("bcihd,bcjhd->bchij", qk_chunks, qk_chunks) * scale
+            attn = torch.softmax(attn, dim=-1)
+            out_chunks = torch.einsum("bchij,bcjhd->bcihd", attn, v_chunks)
+
+            out_sorted = out_chunks.view(B, n_chunks * chunk_size, self.n_heads, self.head_dim)
+            if pad_len > 0:
+                out_sorted = out_sorted[:, :L]
+
+            # Unsort
+            unsort_exp = unsort_idx.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, self.n_heads, self.head_dim)
+            out = out_sorted.gather(1, unsort_exp)
+
+        out = out.reshape(B, L, D)
+        return self.out_proj(out)
+
+
+class GenomicReformer(nn.Module):
+    """Reformer-style model with LSH attention for O(n log n) complexity."""
+
+    def __init__(self, vocab_size, d_model, n_heads, d_ff, n_layers, max_len, dropout,
+                 task_type, n_classes=None, n_hashes=4, bucket_size=32):
+        super().__init__()
+        self.task_type = task_type
+        self.embedding = nn.Embedding(vocab_size, d_model, padding_idx=PAD_TOKEN_ID)
+        self.pos_encoding = _SinusoidalPositionalEncoding(d_model, max_len)
+        self.emb_dropout = nn.Dropout(dropout)
+
+        self.layers = nn.ModuleList()
+        for _ in range(n_layers):
+            self.layers.append(nn.ModuleDict({
+                "attn": LSHAttention(d_model, n_heads, n_hashes, bucket_size),
+                "norm1": nn.LayerNorm(d_model),
+                "ff": nn.Sequential(
+                    nn.Linear(d_model, d_ff), nn.GELU(), nn.Dropout(dropout),
+                    nn.Linear(d_ff, d_model), nn.Dropout(dropout),
+                ),
+                "norm2": nn.LayerNorm(d_model),
+            }))
+
+        self.ln = nn.LayerNorm(d_model)
+
+        if task_type == "pretrain":
+            self.head = nn.Linear(d_model, vocab_size)
+        elif task_type == "classify":
+            self.head = nn.Linear(d_model, n_classes or 2)
+        else:
+            self.head = nn.Linear(d_model, 1)
+
+    def forward(self, input_ids, attention_mask=None):
+        x = self.embedding(input_ids)
+        x = self.pos_encoding(x)
+        x = self.emb_dropout(x)
+
+        for layer in self.layers:
+            # Pre-norm residual
+            h = layer["norm1"](x)
+            x = x + layer["attn"](h, attention_mask)
+            h = layer["norm2"](x)
+            x = x + layer["ff"](h)
+
+        x = self.ln(x)
+
+        if self.task_type == "pretrain":
+            return self.head(x)
+        else:
+            if attention_mask is not None:
+                m = attention_mask.unsqueeze(-1).float()
+                x = (x * m).sum(dim=1) / m.sum(dim=1).clamp(min=1)
+            else:
+                x = x.mean(dim=1)
+            return self.head(x)
+
+
+# ---------------------------------------------------------------------------
+# U-Net (Encoder-Decoder with Skip Connections)
+# ---------------------------------------------------------------------------
+
+class GenomicUNet(nn.Module):
+    """U-Net encoder-decoder with skip connections for per-position prediction."""
+
+    def __init__(self, vocab_size, d_model, n_layers, d_ff, max_len, dropout,
+                 task_type, n_classes=None):
+        super().__init__()
+        self.task_type = task_type
+        self.embedding = nn.Embedding(vocab_size, d_model, padding_idx=PAD_TOKEN_ID)
+        self.emb_dropout = nn.Dropout(dropout)
+
+        # Encoder: downsample via strided conv
+        self.encoders = nn.ModuleList()
+        self.pools = nn.ModuleList()
+        ch = d_model
+        channels = [d_model]
+        for i in range(n_layers):
+            out_ch = min(ch * 2, d_ff)
+            self.encoders.append(nn.Sequential(
+                nn.Conv1d(ch, out_ch, kernel_size=3, padding=1),
+                nn.BatchNorm1d(out_ch),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Conv1d(out_ch, out_ch, kernel_size=3, padding=1),
+                nn.BatchNorm1d(out_ch),
+                nn.GELU(),
+            ))
+            self.pools.append(nn.Conv1d(out_ch, out_ch, kernel_size=2, stride=2))
+            channels.append(out_ch)
+            ch = out_ch
+
+        # Bottleneck
+        self.bottleneck = nn.Sequential(
+            nn.Conv1d(ch, ch, kernel_size=3, padding=1),
+            nn.BatchNorm1d(ch),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+
+        # Decoder: upsample + skip connections
+        self.upconvs = nn.ModuleList()
+        self.decoders = nn.ModuleList()
+        for i in range(n_layers - 1, -1, -1):
+            out_ch = channels[i]
+            self.upconvs.append(nn.ConvTranspose1d(ch, out_ch, kernel_size=2, stride=2))
+            self.decoders.append(nn.Sequential(
+                nn.Conv1d(out_ch * 2, out_ch, kernel_size=3, padding=1),  # concat skip
+                nn.BatchNorm1d(out_ch),
+                nn.GELU(),
+                nn.Dropout(dropout),
+            ))
+            ch = out_ch
+
+        self.ln = nn.LayerNorm(d_model)
+
+        if task_type == "pretrain":
+            self.head = nn.Linear(d_model, vocab_size)
+        elif task_type == "classify":
+            self.head = nn.Linear(d_model, n_classes or 2)
+        else:
+            self.head = nn.Linear(d_model, 1)
+
+    def forward(self, input_ids, attention_mask=None):
+        x = self.embedding(input_ids)  # (B, L, D)
+        x = self.emb_dropout(x)
+        x = x.transpose(1, 2)  # (B, D, L)
+
+        # Encoder path with skip connections
+        skips = []
+        for enc, pool in zip(self.encoders, self.pools):
+            x = enc(x)
+            skips.append(x)
+            x = pool(x)
+
+        x = self.bottleneck(x)
+
+        # Decoder path
+        for upconv, dec, skip in zip(self.upconvs, self.decoders, reversed(skips)):
+            x = upconv(x)
+            # Match skip connection length
+            diff = skip.size(2) - x.size(2)
+            if diff > 0:
+                x = nn.functional.pad(x, (0, diff))
+            elif diff < 0:
+                x = x[:, :, :skip.size(2)]
+            x = torch.cat([x, skip], dim=1)  # concat along channel dim
+            x = dec(x)
+
+        x = x.transpose(1, 2)  # (B, L, D)
+        x = self.ln(x)
+
+        if self.task_type == "pretrain":
+            return self.head(x)
+        else:
+            if attention_mask is not None:
+                m = attention_mask.unsqueeze(-1).float()
+                x = (x * m).sum(dim=1) / m.sum(dim=1).clamp(min=1)
+            else:
+                x = x.mean(dim=1)
+            return self.head(x)
+
+
+# ---------------------------------------------------------------------------
+# Deep Sets (Permutation Invariant)
+# ---------------------------------------------------------------------------
+
+class GenomicDeepSets(nn.Module):
+    """Deep Sets: permutation-invariant architecture for set-level features.
+
+    Useful for metagenomics where sequence order doesn't matter.
+    Applies per-element φ network, then aggregates (sum/mean), then ρ network.
+    """
+
+    def __init__(self, vocab_size, d_model, n_layers, d_ff, max_len, dropout,
+                 task_type, n_classes=None):
+        super().__init__()
+        self.task_type = task_type
+        self.embedding = nn.Embedding(vocab_size, d_model, padding_idx=PAD_TOKEN_ID)
+        self.emb_dropout = nn.Dropout(dropout)
+
+        # φ network: per-element transformation
+        phi_layers = []
+        ch = d_model
+        for i in range(n_layers):
+            out_ch = d_ff if i < n_layers - 1 else d_model
+            phi_layers.extend([
+                nn.Linear(ch, out_ch),
+                nn.LayerNorm(out_ch),
+                nn.GELU(),
+                nn.Dropout(dropout),
+            ])
+            ch = out_ch
+        self.phi = nn.Sequential(*phi_layers)
+
+        # ρ network: post-aggregation transformation
+        self.rho = nn.Sequential(
+            nn.Linear(d_model, d_ff),
+            nn.LayerNorm(d_ff),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_ff, d_model),
+            nn.LayerNorm(d_model),
+            nn.GELU(),
+        )
+
+        if task_type == "pretrain":
+            # For pretrain, expand back to per-position via broadcast + linear
+            self.expand = nn.Linear(d_model * 2, d_model)
+            self.head = nn.Linear(d_model, vocab_size)
+        elif task_type == "classify":
+            self.head = nn.Linear(d_model, n_classes or 2)
+        else:
+            self.head = nn.Linear(d_model, 1)
+
+    def forward(self, input_ids, attention_mask=None):
+        x = self.embedding(input_ids)  # (B, L, D)
+        x = self.emb_dropout(x)
+
+        # Per-element φ
+        h = self.phi(x)  # (B, L, D)
+
+        # Aggregation: masked mean pooling
+        if attention_mask is not None:
+            m = attention_mask.unsqueeze(-1).float()
+            agg = (h * m).sum(dim=1) / m.sum(dim=1).clamp(min=1)  # (B, D)
+        else:
+            agg = h.mean(dim=1)
+
+        # ρ network
+        agg = self.rho(agg)  # (B, D)
+
+        if self.task_type == "pretrain":
+            # Broadcast aggregate back + concat with per-position features
+            agg_expanded = agg.unsqueeze(1).expand_as(h)  # (B, L, D)
+            combined = torch.cat([h, agg_expanded], dim=-1)  # (B, L, 2D)
+            x = self.expand(combined)  # (B, L, D)
+            return self.head(x)
+        else:
+            return self.head(agg)
+
+
+# ---------------------------------------------------------------------------
 # Mamba Model (requires mamba-ssm, CUDA only)
 # ---------------------------------------------------------------------------
 
@@ -1881,8 +2217,24 @@ def build_model(model_type, vocab_size, d_model, n_heads, d_ff, n_layers,
             vocab_size=vocab_size, d_model=d_model, n_layers=n_layers, d_ff=d_ff,
             max_len=max_len, dropout=dropout, task_type=task_type, n_classes=n_classes,
         )
+    elif model_type == "reformer":
+        model = GenomicReformer(
+            vocab_size=vocab_size, d_model=d_model, n_heads=n_heads, d_ff=d_ff,
+            n_layers=n_layers, max_len=max_len, dropout=dropout,
+            task_type=task_type, n_classes=n_classes,
+        )
+    elif model_type == "unet":
+        model = GenomicUNet(
+            vocab_size=vocab_size, d_model=d_model, n_layers=n_layers, d_ff=d_ff,
+            max_len=max_len, dropout=dropout, task_type=task_type, n_classes=n_classes,
+        )
+    elif model_type == "deep_sets":
+        model = GenomicDeepSets(
+            vocab_size=vocab_size, d_model=d_model, n_layers=n_layers, d_ff=d_ff,
+            max_len=max_len, dropout=dropout, task_type=task_type, n_classes=n_classes,
+        )
     else:
-        raise ValueError(f"Unknown model type: {model_type}. Use: transformer, cnn, lstm, gru, conv_transformer, perceiver, rwkv, multiscale_cnn, mamba, hyena")
+        raise ValueError(f"Unknown model type: {model_type}. Use: transformer, cnn, lstm, gru, conv_transformer, perceiver, rwkv, multiscale_cnn, mamba, hyena, reformer, unet, deep_sets")
 
     # Apply proper weight initialization
     model.apply(lambda m: _init_weights(m, d_model))
@@ -2486,6 +2838,38 @@ if __name__ == "__main__":
                             z2 = (emb2 * m1).sum(dim=1) / m1.sum(dim=1).clamp(min=1)
                             cl_loss = contrastive_loss(z1, z2, CONTRASTIVE_TEMP)
                             loss = loss + 0.1 * cl_loss
+
+                # Multi-objective auxiliary losses
+                if AUX_LOSSES and task_type == "pretrain" and model.training:
+                    for _aux in AUX_LOSSES:
+                        try:
+                            with torch.amp.autocast(amp_device, enabled=amp_enabled, dtype=amp_dtype):
+                                if _aux == "contrastive" and hasattr(model, 'embedding'):
+                                    emb_a = model.embedding(tokens_batch)
+                                    _ma = mask_batch.unsqueeze(-1).float()
+                                    za = (emb_a * _ma).sum(1) / _ma.sum(1).clamp(min=1)
+                                    aug_t = snp_noise(tokens_batch.clone(), mask_batch, 0.05, NUM_SPECIAL)
+                                    emb_b = model.embedding(aug_t)
+                                    zb = (emb_b * _ma).sum(1) / _ma.sum(1).clamp(min=1)
+                                    loss = loss + AUX_LOSS_WEIGHT * contrastive_loss(za, zb, 0.07)
+                                elif _aux == "denoise":
+                                    _dn_inp = denoise_corrupt(tokens_batch, mask_batch, NUM_SPECIAL)
+                                    _dn_out = model(_dn_inp, attention_mask=mask_batch)
+                                    _dn_loss = nn.functional.cross_entropy(
+                                        _dn_out.reshape(-1, vocab_size), tokens_batch.reshape(-1),
+                                        ignore_index=PAD_TOKEN_ID)
+                                    loss = loss + AUX_LOSS_WEIGHT * _dn_loss
+                                elif _aux == "clm" and OBJECTIVE != "clm":
+                                    _clm_inp = tokens_batch[:, :-1]
+                                    _clm_tgt = tokens_batch[:, 1:]
+                                    _clm_mask = mask_batch[:, :-1]
+                                    _clm_out = model(_clm_inp, attention_mask=_clm_mask)
+                                    _clm_loss = nn.functional.cross_entropy(
+                                        _clm_out.reshape(-1, vocab_size), _clm_tgt.reshape(-1),
+                                        ignore_index=PAD_TOKEN_ID)
+                                    loss = loss + AUX_LOSS_WEIGHT * _clm_loss
+                        except Exception:
+                            pass  # skip aux loss on error
 
                 # Knowledge distillation: blend task loss with soft-target KL from teacher
                 if _teacher_model is not None and task_type == "pretrain":

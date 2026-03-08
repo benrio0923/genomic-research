@@ -74,6 +74,24 @@ MODEL_ARCHITECTURES = {
         "pros": "Sub-quadratic complexity, good for long sequences (HyenaDNA-inspired)",
         "cons": "Requires FFT, newer architecture with less community support",
     },
+    "reformer": {
+        "description": "Reformer (LSH Attention)",
+        "params": "d_model, n_heads, d_ff, n_layers",
+        "pros": "O(n log n) approximate attention, memory-efficient",
+        "cons": "Approximate attention may lose precision on short sequences",
+    },
+    "unet": {
+        "description": "U-Net (Encoder-Decoder with Skip Connections)",
+        "params": "d_model, d_ff, n_layers",
+        "pros": "Excellent for per-position prediction, skip connections preserve detail",
+        "cons": "Requires power-of-2 friendly sequence lengths for best performance",
+    },
+    "deep_sets": {
+        "description": "Deep Sets (Permutation Invariant)",
+        "params": "d_model, d_ff, n_layers",
+        "pros": "Order-invariant, good for metagenomics and set-level tasks",
+        "cons": "Loses positional information by design",
+    },
 }
 
 
