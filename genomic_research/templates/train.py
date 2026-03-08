@@ -84,6 +84,9 @@ POS_ENCODING = _cfg("pos_encoding", "sinusoidal")  # sinusoidal, rotary, alibi, 
 KERNEL_SIZES = _cfg("kernel_sizes", [7, 7, 7, 7])  # CNN conv kernel sizes per layer
 CNN_CHANNELS = _cfg("cnn_channels", 256)            # CNN intermediate channels
 LSTM_BIDIRECTIONAL = _cfg("lstm_bidirectional", True)
+RNN_TYPE = _cfg("rnn_type", "lstm")                # lstm or gru
+CNN_DILATION = _cfg("cnn_dilation", False)          # use exponential dilation in CNN
+STOCHASTIC_DEPTH = _cfg("stochastic_depth", 0.0)   # layer drop probability (0.0 = disabled)
 MAMBA_D_STATE = _cfg("mamba_d_state", 16)
 MAMBA_D_CONV = _cfg("mamba_d_conv", 4)
 MAMBA_EXPAND = _cfg("mamba_expand", 2)
@@ -239,10 +242,26 @@ class ALiBiPositionBias(nn.Module):
         return -bias  # negative because closer = higher attention
 
 
+class DropPath(nn.Module):
+    """Stochastic depth — randomly drop entire residual branches during training."""
+
+    def __init__(self, drop_prob=0.0):
+        super().__init__()
+        self.drop_prob = drop_prob
+
+    def forward(self, x):
+        if self.drop_prob == 0.0 or not self.training:
+            return x
+        keep_prob = 1 - self.drop_prob
+        shape = (x.shape[0],) + (1,) * (x.ndim - 1)
+        mask = torch.bernoulli(torch.full(shape, keep_prob, device=x.device, dtype=x.dtype))
+        return x * mask / keep_prob
+
+
 class GenomicTransformerLayer(nn.Module):
     """Custom Transformer layer supporting RoPE/ALiBi."""
 
-    def __init__(self, d_model, n_heads, d_ff, dropout, pos_type="sinusoidal"):
+    def __init__(self, d_model, n_heads, d_ff, dropout, pos_type="sinusoidal", drop_path=0.0):
         super().__init__()
         self.pos_type = pos_type
         self.n_heads = n_heads
@@ -265,6 +284,7 @@ class GenomicTransformerLayer(nn.Module):
         )
         self.attn_dropout = nn.Dropout(dropout)
         self.ff_dropout = nn.Dropout(dropout)
+        self.drop_path = DropPath(drop_path) if drop_path > 0 else nn.Identity()
 
     def forward(self, x, attn_bias=None, rotary_freqs=None, key_padding_mask=None, causal_mask=None):
         B, L, D = x.shape
@@ -317,10 +337,10 @@ class GenomicTransformerLayer(nn.Module):
 
         out = out.transpose(1, 2).reshape(B, L, D)
         out = self.out_proj(out)
-        x = x + self.ff_dropout(out)
+        x = x + self.drop_path(self.ff_dropout(out))
 
         # Feed-forward with pre-norm
-        x = x + self.ff(self.norm2(x))
+        x = x + self.drop_path(self.ff(self.norm2(x)))
         return x
 
 
@@ -328,7 +348,8 @@ class GenomicTransformer(nn.Module):
     """Transformer Encoder for genomic sequence modeling."""
 
     def __init__(self, vocab_size, d_model, n_heads, d_ff, n_layers, max_len, dropout,
-                 task_type, n_classes=None, pos_encoding="sinusoidal"):
+                 task_type, n_classes=None, pos_encoding="sinusoidal",
+                 stochastic_depth=0.0):
         super().__init__()
         self.task_type = task_type
         self.d_model = d_model
@@ -356,11 +377,13 @@ class GenomicTransformer(nn.Module):
             self.pos_encoding = PositionalEncoding(d_model, max_len=max_len, dropout=dropout)
             self.use_custom_layers = False
 
-        # Encoder layers
+        # Encoder layers (linearly increasing drop path rate per layer)
+        _dp_rates = [stochastic_depth * i / max(n_layers - 1, 1) for i in range(n_layers)]
         if self.use_custom_layers:
             self.layers = nn.ModuleList([
-                GenomicTransformerLayer(d_model, n_heads, d_ff, dropout, pos_encoding)
-                for _ in range(n_layers)
+                GenomicTransformerLayer(d_model, n_heads, d_ff, dropout, pos_encoding,
+                                       drop_path=_dp_rates[i])
+                for i in range(n_layers)
             ])
         else:
             encoder_layer = nn.TransformerEncoderLayer(
@@ -450,7 +473,8 @@ class GenomicCNN(nn.Module):
     """1D Convolutional model with residual blocks for genomic sequences."""
 
     def __init__(self, vocab_size, d_model, n_layers, d_ff, max_len, dropout,
-                 task_type, n_classes=None, kernel_sizes=None, channels=None):
+                 task_type, n_classes=None, kernel_sizes=None, channels=None,
+                 use_dilation=False):
         super().__init__()
         self.task_type = task_type
         ks = kernel_sizes or [7] * n_layers
@@ -466,8 +490,10 @@ class GenomicCNN(nn.Module):
         self.blocks = nn.ModuleList()
         for i in range(n_layers):
             k = ks[i] if i < len(ks) else ks[-1]
+            d = (2 ** i) if use_dilation else 1  # exponential dilation: 1, 2, 4, 8, ...
+            pad = (k // 2) * d  # dilated padding to preserve length
             self.blocks.append(nn.Sequential(
-                nn.Conv1d(ch, ch, k, padding=k // 2),
+                nn.Conv1d(ch, ch, k, padding=pad, dilation=d),
                 nn.BatchNorm1d(ch),
                 nn.GELU(),
                 nn.Dropout(dropout),
@@ -518,10 +544,10 @@ class GenomicCNN(nn.Module):
 # ---------------------------------------------------------------------------
 
 class GenomicLSTM(nn.Module):
-    """Bidirectional LSTM for genomic sequences."""
+    """Bidirectional LSTM/GRU for genomic sequences."""
 
     def __init__(self, vocab_size, d_model, n_layers, d_ff, max_len, dropout,
-                 task_type, n_classes=None, bidirectional=True):
+                 task_type, n_classes=None, bidirectional=True, rnn_type="lstm"):
         super().__init__()
         self.task_type = task_type
         self.bidirectional = bidirectional
@@ -529,7 +555,8 @@ class GenomicLSTM(nn.Module):
         self.embedding = nn.Embedding(vocab_size, d_model, padding_idx=PAD_TOKEN_ID)
         self.emb_dropout = nn.Dropout(dropout)
 
-        self.lstm = nn.LSTM(
+        rnn_cls = nn.GRU if rnn_type == "gru" else nn.LSTM
+        self.rnn = rnn_cls(
             input_size=d_model,
             hidden_size=d_model // (2 if bidirectional else 1),
             num_layers=n_layers,
@@ -561,10 +588,10 @@ class GenomicLSTM(nn.Module):
             packed = nn.utils.rnn.pack_padded_sequence(
                 x, lengths, batch_first=True, enforce_sorted=False
             )
-            out, _ = self.lstm(packed)
+            out, _ = self.rnn(packed)
             x, _ = nn.utils.rnn.pad_packed_sequence(out, batch_first=True, total_length=input_ids.size(1))
         else:
-            x, _ = self.lstm(x)
+            x, _ = self.rnn(x)
 
         x = self.ln(x)
 
@@ -712,18 +739,21 @@ def build_model(model_type, vocab_size, d_model, n_heads, d_ff, n_layers,
             vocab_size=vocab_size, d_model=d_model, n_heads=n_heads, d_ff=d_ff,
             n_layers=n_layers, max_len=max_len, dropout=dropout,
             task_type=task_type, n_classes=n_classes, pos_encoding=pe,
+            stochastic_depth=STOCHASTIC_DEPTH,
         )
     elif model_type == "cnn":
         model = GenomicCNN(
             vocab_size=vocab_size, d_model=d_model, n_layers=n_layers, d_ff=d_ff,
             max_len=max_len, dropout=dropout, task_type=task_type,
             n_classes=n_classes, kernel_sizes=KERNEL_SIZES, channels=CNN_CHANNELS,
+            use_dilation=CNN_DILATION,
         )
-    elif model_type == "lstm":
+    elif model_type in ("lstm", "gru"):
         model = GenomicLSTM(
             vocab_size=vocab_size, d_model=d_model, n_layers=n_layers, d_ff=d_ff,
             max_len=max_len, dropout=dropout, task_type=task_type,
             n_classes=n_classes, bidirectional=LSTM_BIDIRECTIONAL,
+            rnn_type="gru" if model_type == "gru" else RNN_TYPE,
         )
     elif model_type == "mamba":
         model = GenomicMamba(
@@ -733,7 +763,7 @@ def build_model(model_type, vocab_size, d_model, n_heads, d_ff, n_layers,
             expand=MAMBA_EXPAND,
         )
     else:
-        raise ValueError(f"Unknown model type: {model_type}. Use: transformer, cnn, lstm, mamba")
+        raise ValueError(f"Unknown model type: {model_type}. Use: transformer, cnn, lstm, gru, mamba")
 
     # Apply proper weight initialization
     model.apply(lambda m: _init_weights(m, d_model))

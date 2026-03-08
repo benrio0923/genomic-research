@@ -216,16 +216,15 @@ Priority: HIGH — expand model capabilities.
 - [ ] Add `USE_MOE`, `N_EXPERTS`, `MOE_TOP_K` hyperparameters
 - [ ] File: `genomic_research/templates/train.py`
 
-### T35: Implement GRU variant for LSTM architecture
-- [ ] Add `RNN_TYPE = "lstm"` or `"gru"` hyperparameter
-- [ ] GRU: fewer parameters, often similar performance
-- [ ] File: `genomic_research/templates/train.py`
+### T35: Implement GRU variant for LSTM architecture ✅
+- [x] `RNN_TYPE` hyperparameter + `model_type="gru"` shortcut
+- [x] GenomicLSTM now uses `nn.GRU` or `nn.LSTM` based on config
+- [x] File: `genomic_research/templates/train.py`
 
-### T36: Implement dilated CNN
-- [ ] Exponentially increasing dilation rates (1, 2, 4, 8, ...)
-- [ ] Captures long-range dependencies without deep stacking
-- [ ] Add `CNN_DILATION = True/False` hyperparameter
-- [ ] File: `genomic_research/templates/train.py`
+### T36: Implement dilated CNN ✅
+- [x] `CNN_DILATION` hyperparameter for exponential dilation (1, 2, 4, 8...)
+- [x] Dilated padding preserves sequence length
+- [x] File: `genomic_research/templates/train.py`
 
 ### T37: Implement Reformer-style LSH attention
 - [ ] Locality-Sensitive Hashing for approximate attention
@@ -284,10 +283,11 @@ Priority: HIGH — expand model capabilities.
 - [x] Applied via `model.apply()` in `build_model()`
 - [x] File: `genomic_research/templates/train.py`
 
-### T47: Implement stochastic depth (layer drop)
-- [ ] Randomly skip layers during training (survival probability)
-- [ ] Add `STOCHASTIC_DEPTH = 0.1` hyperparameter
-- [ ] File: `genomic_research/templates/train.py`
+### T47: Implement stochastic depth (layer drop) ✅
+- [x] `DropPath` module with linearly increasing drop rate per layer
+- [x] `STOCHASTIC_DEPTH` hyperparameter (0.0 = disabled)
+- [x] Applied to both attention and FF residual connections
+- [x] File: `genomic_research/templates/train.py`
 
 ### T48: Implement Pre-LayerNorm vs Post-LayerNorm toggle
 - [ ] Current: Pre-norm (default for stability)
