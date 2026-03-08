@@ -77,6 +77,7 @@ LR_SCHEDULE = _cfg("lr_schedule", "cosine")        # lr schedule: constant, cosi
 WARMUP_RATIO = _cfg("warmup_ratio", 0.05)          # fraction of training for LR warmup
 OBJECTIVE = _cfg("objective", "mlm")               # mlm or clm
 MASK_RATIO = _cfg("mask_ratio", 0.15)              # fraction of tokens to mask (MLM only)
+LABEL_SMOOTHING = _cfg("label_smoothing", 0.0)     # label smoothing for CE loss (0.0 = off)
 
 # --- Architecture-specific ---
 POS_ENCODING = _cfg("pos_encoding", "sinusoidal")  # sinusoidal, rotary, alibi, learned
@@ -100,6 +101,11 @@ NUM_WORKERS = 0                # dataloader workers (0 = main process)
 PIN_MEMORY = False             # pin memory for faster CUDA transfer
 USE_DDP = False                # distributed data parallel (multi-GPU)
 SEED = _cfg("seed", 42)       # random seed for reproducibility
+USE_EMA = _cfg("use_ema", False)   # exponential moving average of model weights
+EMA_DECAY = _cfg("ema_decay", 0.999)  # EMA decay factor
+EARLY_STOP_PATIENCE = _cfg("early_stop_patience", 0)  # 0 = disabled; stop after N evals without improvement
+USE_SWA = _cfg("use_swa", False)   # stochastic weight averaging in final 25% of training
+SWA_LR = _cfg("swa_lr", 1e-5)     # SWA learning rate
 
 # ---------------------------------------------------------------------------
 # Data augmentation utilities
@@ -272,26 +278,43 @@ class GenomicTransformerLayer(nn.Module):
         if rotary_freqs is not None:
             q, k = apply_rotary_emb(q, k, rotary_freqs)
 
-        # Scaled dot-product attention
-        scale = self.head_dim ** -0.5
-        attn = torch.matmul(q, k.transpose(-2, -1)) * scale
+        # Use PyTorch SDPA (Flash Attention / Memory-Efficient kernels) when possible
+        _use_sdpa = (attn_bias is None) and hasattr(torch.nn.functional, "scaled_dot_product_attention")
 
-        # Apply ALiBi bias
-        if attn_bias is not None:
-            attn = attn + attn_bias
+        if _use_sdpa:
+            # Build combined attention mask for SDPA
+            attn_mask = None
+            if causal_mask is not None and key_padding_mask is not None:
+                # Combine: causal (L,L) + padding (B,L) → (B,1,L,L)
+                pad_mask_2d = key_padding_mask.unsqueeze(1).unsqueeze(2)  # (B,1,1,L)
+                pad_mask_2d = torch.zeros_like(pad_mask_2d, dtype=q.dtype).masked_fill_(pad_mask_2d, float("-inf"))
+                attn_mask = causal_mask.unsqueeze(0).unsqueeze(0) + pad_mask_2d
+            elif causal_mask is not None:
+                attn_mask = causal_mask.unsqueeze(0).unsqueeze(0).expand(B, self.n_heads, L, L)
+            elif key_padding_mask is not None:
+                pad_mask_2d = key_padding_mask.unsqueeze(1).unsqueeze(2)  # (B,1,1,L)
+                attn_mask = torch.zeros(B, 1, 1, L, dtype=q.dtype, device=q.device).masked_fill_(pad_mask_2d, float("-inf"))
 
-        # Apply causal mask
-        if causal_mask is not None:
-            attn = attn + causal_mask.unsqueeze(0).unsqueeze(0)
+            dropout_p = self.attn_dropout.p if self.training else 0.0
+            out = torch.nn.functional.scaled_dot_product_attention(
+                q, k, v, attn_mask=attn_mask, dropout_p=dropout_p,
+            )
+        else:
+            # Fallback: manual attention (needed for ALiBi bias)
+            scale = self.head_dim ** -0.5
+            attn = torch.matmul(q, k.transpose(-2, -1)) * scale
 
-        # Apply key padding mask
-        if key_padding_mask is not None:
-            attn = attn.masked_fill(key_padding_mask.unsqueeze(1).unsqueeze(2), float("-inf"))
+            if attn_bias is not None:
+                attn = attn + attn_bias
+            if causal_mask is not None:
+                attn = attn + causal_mask.unsqueeze(0).unsqueeze(0)
+            if key_padding_mask is not None:
+                attn = attn.masked_fill(key_padding_mask.unsqueeze(1).unsqueeze(2), float("-inf"))
 
-        attn = torch.softmax(attn, dim=-1)
-        attn = self.attn_dropout(attn)
+            attn = torch.softmax(attn, dim=-1)
+            attn = self.attn_dropout(attn)
+            out = torch.matmul(attn, v)
 
-        out = torch.matmul(attn, v)
         out = out.transpose(1, 2).reshape(B, L, D)
         out = self.out_proj(out)
         x = x + self.ff_dropout(out)
@@ -628,31 +651,82 @@ class GenomicMamba(nn.Module):
 # Model factory
 # ---------------------------------------------------------------------------
 
+class ModelEMA:
+    """Exponential Moving Average of model weights for better generalization."""
+
+    def __init__(self, model, decay=0.999):
+        import copy
+        self.decay = decay
+        self.shadow = copy.deepcopy(model)
+        self.shadow.eval()
+        for p in self.shadow.parameters():
+            p.requires_grad_(False)
+
+    @torch.no_grad()
+    def update(self, model):
+        for ema_p, model_p in zip(self.shadow.parameters(), model.parameters()):
+            ema_p.data.mul_(self.decay).add_(model_p.data, alpha=1 - self.decay)
+
+    def state_dict(self):
+        return self.shadow.state_dict()
+
+    def load_state_dict(self, state_dict):
+        self.shadow.load_state_dict(state_dict)
+
+
+def _init_weights(module, d_model):
+    """Initialize model weights following best practices for transformers."""
+    if isinstance(module, nn.Linear):
+        nn.init.trunc_normal_(module.weight, std=0.02)
+        if module.bias is not None:
+            nn.init.zeros_(module.bias)
+    elif isinstance(module, nn.Embedding):
+        nn.init.trunc_normal_(module.weight, std=0.02)
+        if module.padding_idx is not None:
+            with torch.no_grad():
+                module.weight[module.padding_idx].fill_(0)
+    elif isinstance(module, nn.LayerNorm):
+        nn.init.ones_(module.weight)
+        nn.init.zeros_(module.bias)
+    elif isinstance(module, nn.Conv1d):
+        nn.init.kaiming_normal_(module.weight, nonlinearity="linear")
+        if module.bias is not None:
+            nn.init.zeros_(module.bias)
+    elif isinstance(module, nn.LSTM):
+        for name, param in module.named_parameters():
+            if "weight_ih" in name:
+                nn.init.xavier_uniform_(param)
+            elif "weight_hh" in name:
+                nn.init.orthogonal_(param)
+            elif "bias" in name:
+                nn.init.zeros_(param)
+
+
 def build_model(model_type, vocab_size, d_model, n_heads, d_ff, n_layers,
                 max_len, dropout, task_type, n_classes=None,
                 pos_encoding=None, **kwargs):
     """Build model based on MODEL_TYPE."""
     if model_type == "transformer":
         pe = pos_encoding or POS_ENCODING
-        return GenomicTransformer(
+        model = GenomicTransformer(
             vocab_size=vocab_size, d_model=d_model, n_heads=n_heads, d_ff=d_ff,
             n_layers=n_layers, max_len=max_len, dropout=dropout,
             task_type=task_type, n_classes=n_classes, pos_encoding=pe,
         )
     elif model_type == "cnn":
-        return GenomicCNN(
+        model = GenomicCNN(
             vocab_size=vocab_size, d_model=d_model, n_layers=n_layers, d_ff=d_ff,
             max_len=max_len, dropout=dropout, task_type=task_type,
             n_classes=n_classes, kernel_sizes=KERNEL_SIZES, channels=CNN_CHANNELS,
         )
     elif model_type == "lstm":
-        return GenomicLSTM(
+        model = GenomicLSTM(
             vocab_size=vocab_size, d_model=d_model, n_layers=n_layers, d_ff=d_ff,
             max_len=max_len, dropout=dropout, task_type=task_type,
             n_classes=n_classes, bidirectional=LSTM_BIDIRECTIONAL,
         )
     elif model_type == "mamba":
-        return GenomicMamba(
+        model = GenomicMamba(
             vocab_size=vocab_size, d_model=d_model, n_layers=n_layers, d_ff=d_ff,
             max_len=max_len, dropout=dropout, task_type=task_type,
             n_classes=n_classes, d_state=MAMBA_D_STATE, d_conv=MAMBA_D_CONV,
@@ -661,6 +735,9 @@ def build_model(model_type, vocab_size, d_model, n_heads, d_ff, n_layers,
     else:
         raise ValueError(f"Unknown model type: {model_type}. Use: transformer, cnn, lstm, mamba")
 
+    # Apply proper weight initialization
+    model.apply(lambda m: _init_weights(m, d_model))
+    return model
 
 
 # ---------------------------------------------------------------------------
@@ -761,6 +838,11 @@ if __name__ == "__main__":
     if amp_enabled:
         print("Mixed precision: fp16 (CUDA AMP)")
 
+    # Model EMA
+    ema = ModelEMA(model, decay=EMA_DECAY) if USE_EMA else None
+    if ema:
+        print(f"Model EMA: decay={EMA_DECAY}")
+
     num_params = sum(p.numel() for p in model.parameters())
     print(f"Parameters: {num_params:,}")
 
@@ -772,14 +854,18 @@ if __name__ == "__main__":
     )
 
     # Loss function
+    _ls = LABEL_SMOOTHING
     if task_type == "pretrain":
-        criterion = nn.CrossEntropyLoss(ignore_index=PAD_TOKEN_ID)
+        criterion = nn.CrossEntropyLoss(ignore_index=PAD_TOKEN_ID, label_smoothing=_ls)
     elif task_type == "classify":
         class_weights = config.get("class_weights")
         if class_weights:
-            criterion = nn.CrossEntropyLoss(weight=torch.tensor(class_weights, dtype=torch.float32, device=device))
+            criterion = nn.CrossEntropyLoss(
+                weight=torch.tensor(class_weights, dtype=torch.float32, device=device),
+                label_smoothing=_ls,
+            )
         else:
-            criterion = nn.CrossEntropyLoss()
+            criterion = nn.CrossEntropyLoss(label_smoothing=_ls)
     else:
         criterion = nn.MSELoss()
 
@@ -825,13 +911,24 @@ if __name__ == "__main__":
 
         if LR_SCHEDULE == "cosine":
             return LEARNING_RATE * 0.5 * (1 + math.cos(math.pi * adjusted_progress))
+        elif LR_SCHEDULE == "linear":
+            return LEARNING_RATE * max(0.0, 1.0 - adjusted_progress)
+        elif LR_SCHEDULE == "one_cycle":
+            # Ramp up to peak then cosine decay
+            if adjusted_progress < 0.3:
+                return LEARNING_RATE * (1 + 9 * adjusted_progress / 0.3)  # up to 10x
+            else:
+                decay_progress = (adjusted_progress - 0.3) / 0.7
+                return LEARNING_RATE * 10 * 0.5 * (1 + math.cos(math.pi * decay_progress))
+        elif LR_SCHEDULE == "exponential":
+            return LEARNING_RATE * (0.01 ** adjusted_progress)
         elif LR_SCHEDULE == "step":
             if adjusted_progress > 0.7:
                 return LEARNING_RATE * 0.01
             elif adjusted_progress > 0.4:
                 return LEARNING_RATE * 0.1
             return LEARNING_RATE
-        else:
+        else:  # constant
             return LEARNING_RATE
 
 
@@ -846,6 +943,7 @@ if __name__ == "__main__":
     smooth_train_loss = 0.0
     best_val_score = None
     best_state_dict = None
+    _evals_without_improvement = 0
 
     history = {
         "steps": [], "losses": [], "lrs": [],
@@ -855,6 +953,14 @@ if __name__ == "__main__":
 
     eval_interval_seconds = max(TIME_BUDGET * 0.2, 10)
     last_eval_time = 0.0
+
+    # SWA setup
+    swa_model = None
+    swa_n = 0
+    if USE_SWA:
+        from torch.optim.swa_utils import AveragedModel
+        swa_model = AveragedModel(model)
+        print(f"SWA: enabled (lr={SWA_LR}, collects in final 25%)")
 
     model.train()
 
@@ -934,6 +1040,15 @@ if __name__ == "__main__":
                         optimizer.step()
                     optimizer.zero_grad()
 
+                    # Update EMA weights
+                    if ema is not None:
+                        ema.update(model)
+
+                    # SWA: collect snapshots in final 25% of training
+                    if swa_model is not None and total_training_time > TIME_BUDGET * 0.75:
+                        swa_model.update_parameters(model)
+                        swa_n += 1
+
             except RuntimeError as e:
                 if "out of memory" in str(e).lower():
                     print(f"\n[OOM] CUDA out of memory at step {step}. Clearing cache and skipping batch.")
@@ -988,6 +1103,12 @@ if __name__ == "__main__":
                 if best_val_score is None or eval_results["val_score"] > best_val_score:
                     best_val_score = eval_results["val_score"]
                     best_state_dict = {k: v.clone() for k, v in model.state_dict().items()}
+                    _evals_without_improvement = 0
+                else:
+                    _evals_without_improvement += 1
+                    if EARLY_STOP_PATIENCE > 0 and _evals_without_improvement >= EARLY_STOP_PATIENCE:
+                        print(f"\nEarly stopping: no improvement for {EARLY_STOP_PATIENCE} evaluations")
+                        _interrupted = True
                 model.train()
                 last_eval_time = total_training_time
 
@@ -1031,6 +1152,43 @@ if __name__ == "__main__":
             results = final_results
     else:
         results = final_results
+
+    # EMA evaluation — use EMA weights if they improve val_score
+    if ema is not None:
+        ema.shadow.eval()
+        ema_results = evaluate(
+            ema.shadow, data, task_type, config,
+            objective=OBJECTIVE, batch_size=actual_batch_size * 2,
+            device=device, mask_ratio=MASK_RATIO,
+        )
+        if ema_results["val_score"] > results["val_score"]:
+            print(f"EMA improved val_score: {results['val_score']:.6f} → {ema_results['val_score']:.6f}")
+            model.load_state_dict(ema.state_dict())
+            results = ema_results
+
+    # SWA evaluation — use SWA weights if they improve val_score
+    if swa_model is not None and swa_n > 0:
+        from torch.optim.swa_utils import update_bn
+        # Update batch norm stats for SWA model
+        try:
+            swa_model.to(device)
+            update_bn(
+                make_dataloader(data["train_tokens"], data["train_mask"], actual_batch_size, shuffle=True),
+                swa_model, device=device,
+            )
+        except Exception:
+            pass  # BN update is optional — skip if model has no BN layers
+        swa_model.eval()
+        swa_results = evaluate(
+            swa_model, data, task_type, config,
+            objective=OBJECTIVE, batch_size=actual_batch_size * 2,
+            device=device, mask_ratio=MASK_RATIO,
+        )
+        if swa_results["val_score"] > results["val_score"]:
+            print(f"SWA improved val_score: {results['val_score']:.6f} → {swa_results['val_score']:.6f} ({swa_n} snapshots)")
+            # Extract the inner module weights from AveragedModel
+            model.load_state_dict(swa_model.module.state_dict())
+            results = swa_results
 
     # ---------------------------------------------------------------------------
     # Summary
