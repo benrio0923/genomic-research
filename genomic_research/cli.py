@@ -960,6 +960,347 @@ def cmd_motif_discovery(args):
     print("Saved to reports/motifs.txt")
 
 
+def cmd_align_score(args):
+    """Score pairwise sequence similarity using trained model embeddings (T127)."""
+    import torch
+
+    ckpt_path = args.checkpoint
+    if not os.path.exists(ckpt_path):
+        print(f"Error: checkpoint not found: {ckpt_path}", file=sys.stderr)
+        sys.exit(1)
+
+    fasta_path = args.fasta
+    if not os.path.exists(fasta_path):
+        print(f"Error: FASTA file not found: {fasta_path}", file=sys.stderr)
+        sys.exit(1)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+
+    sys.path.insert(0, os.getcwd())
+    from prepare import load_sequences, load_tokenizer
+    from train import build_model
+
+    seqs = load_sequences(fasta_path)
+    if len(seqs) < 2:
+        print("Error: need at least 2 sequences for pairwise comparison", file=sys.stderr)
+        sys.exit(1)
+
+    # Load tokenizer and model
+    tok = load_tokenizer(os.path.join(os.path.expanduser("~"), ".cache", "genomic-research", "tokenizer.json"))
+    model_cfg = ckpt.get("model_config", {})
+    model = build_model(**model_cfg).to(device)
+    model.load_state_dict(ckpt["model_state_dict"])
+    model.eval()
+
+    max_len = model_cfg.get("max_len", 512)
+    top_k = min(args.top_k, len(seqs) * (len(seqs) - 1) // 2)
+
+    # Embed all sequences
+    embeddings = []
+    ids = []
+    with torch.no_grad():
+        for seq_id, seq in seqs:
+            token_ids = tok.encode(seq)[:max_len]
+            token_ids += [0] * (max_len - len(token_ids))
+            x = torch.tensor([token_ids], dtype=torch.long, device=device)
+            out = model(x)
+            # Use mean pooling for embedding
+            emb = out.float().mean(dim=1).squeeze(0).cpu().numpy()
+            embeddings.append(emb)
+            ids.append(seq_id)
+
+    import numpy as np
+    embeddings = np.array(embeddings)
+
+    # Compute cosine similarity matrix
+    norms = np.linalg.norm(embeddings, axis=1, keepdims=True) + 1e-9
+    normed = embeddings / norms
+    sim_matrix = normed @ normed.T
+
+    # Report top-k most similar pairs
+    pairs = []
+    for i in range(len(ids)):
+        for j in range(i + 1, len(ids)):
+            pairs.append((sim_matrix[i, j], ids[i], ids[j]))
+    pairs.sort(reverse=True)
+
+    print(f"Pairwise similarity (top {top_k} of {len(pairs)} pairs):")
+    print(f"{'Seq 1':<25} {'Seq 2':<25} {'Cosine Sim':>12}")
+    print("-" * 64)
+    for score, id1, id2 in pairs[:top_k]:
+        print(f"{id1:<25} {id2:<25} {score:>12.4f}")
+
+
+def cmd_mutation_rate(args):
+    """Estimate per-position mutation rates from pre-trained model (T131)."""
+    import torch
+
+    ckpt_path = args.checkpoint
+    fasta_path = args.fasta
+
+    if not os.path.exists(ckpt_path):
+        print(f"Error: checkpoint not found: {ckpt_path}", file=sys.stderr)
+        sys.exit(1)
+    if not os.path.exists(fasta_path):
+        print(f"Error: FASTA file not found: {fasta_path}", file=sys.stderr)
+        sys.exit(1)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+
+    sys.path.insert(0, os.getcwd())
+    from prepare import load_sequences, load_tokenizer
+    from train import build_model
+
+    seqs = load_sequences(fasta_path)
+    tok = load_tokenizer(os.path.join(os.path.expanduser("~"), ".cache", "genomic-research", "tokenizer.json"))
+    model_cfg = ckpt.get("model_config", {})
+    model = build_model(**model_cfg).to(device)
+    model.load_state_dict(ckpt["model_state_dict"])
+    model.eval()
+
+    max_len = model_cfg.get("max_len", 512)
+    import numpy as np
+
+    # For each sequence, mask each position and measure model uncertainty (entropy)
+    # High entropy = position is more variable = higher mutation rate
+    out_path = args.output or "reports/mutation_rates.tsv"
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+
+    with open(out_path, "w") as f:
+        f.write("seq_id\tposition\tentropy\tpredicted_base\n")
+        for seq_id, seq in seqs[:args.max_seqs]:
+            token_ids = tok.encode(seq)[:max_len]
+            orig_len = len(token_ids)
+            token_ids += [0] * (max_len - len(token_ids))
+
+            with torch.no_grad():
+                for pos in range(min(orig_len, max_len)):
+                    masked = list(token_ids)
+                    masked[pos] = 1  # [MASK] token
+                    x = torch.tensor([masked], dtype=torch.long, device=device)
+                    logits = model(x)
+                    probs = torch.softmax(logits[0, pos].float(), dim=-1)
+                    entropy = -(probs * (probs + 1e-9).log()).sum().item()
+                    pred_base = probs.argmax().item()
+                    f.write(f"{seq_id}\t{pos}\t{entropy:.4f}\t{pred_base}\n")
+
+    print(f"Mutation rates saved to {out_path}")
+    print(f"Higher entropy = more variable position (potential mutation hotspot)")
+
+
+def cmd_msa_embed(args):
+    """Build guide tree from model embeddings for MSA (T132)."""
+    import torch
+
+    ckpt_path = args.checkpoint
+    fasta_path = args.fasta
+
+    if not os.path.exists(ckpt_path):
+        print(f"Error: checkpoint not found: {ckpt_path}", file=sys.stderr)
+        sys.exit(1)
+    if not os.path.exists(fasta_path):
+        print(f"Error: FASTA file not found: {fasta_path}", file=sys.stderr)
+        sys.exit(1)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+
+    sys.path.insert(0, os.getcwd())
+    from prepare import load_sequences, load_tokenizer
+    from train import build_model
+    import numpy as np
+
+    seqs = load_sequences(fasta_path)
+    tok = load_tokenizer(os.path.join(os.path.expanduser("~"), ".cache", "genomic-research", "tokenizer.json"))
+    model_cfg = ckpt.get("model_config", {})
+    model = build_model(**model_cfg).to(device)
+    model.load_state_dict(ckpt["model_state_dict"])
+    model.eval()
+
+    max_len = model_cfg.get("max_len", 512)
+
+    # Embed all sequences
+    embeddings = []
+    ids = []
+    with torch.no_grad():
+        for seq_id, seq in seqs:
+            token_ids = tok.encode(seq)[:max_len]
+            token_ids += [0] * (max_len - len(token_ids))
+            x = torch.tensor([token_ids], dtype=torch.long, device=device)
+            out = model(x)
+            emb = out.float().mean(dim=1).squeeze(0).cpu().numpy()
+            embeddings.append(emb)
+            ids.append(seq_id)
+
+    embeddings = np.array(embeddings)
+
+    # Build distance matrix (cosine distance)
+    norms = np.linalg.norm(embeddings, axis=1, keepdims=True) + 1e-9
+    normed = embeddings / norms
+    sim_matrix = normed @ normed.T
+    dist_matrix = 1.0 - sim_matrix
+
+    # Build neighbor-joining guide tree (simple UPGMA)
+    n = len(ids)
+    clusters = {i: ids[i] for i in range(n)}
+    dists = {(i, j): dist_matrix[i, j] for i in range(n) for j in range(i + 1, n)}
+
+    newick_parts = {i: ids[i] for i in range(n)}
+    next_id = n
+
+    while len(clusters) > 1:
+        # Find closest pair
+        min_pair = min(dists, key=dists.get)
+        i, j = min_pair
+        d = dists[min_pair]
+
+        # Merge
+        new_name = f"({newick_parts[i]}:{d/2:.6f},{newick_parts[j]}:{d/2:.6f})"
+        newick_parts[next_id] = new_name
+
+        # Update distances (UPGMA average)
+        new_dists = {}
+        for k in clusters:
+            if k == i or k == j:
+                continue
+            di = dists.get((min(i, k), max(i, k)), 0)
+            dj = dists.get((min(j, k), max(j, k)), 0)
+            new_dists[(min(next_id, k), max(next_id, k))] = (di + dj) / 2
+
+        # Remove old entries
+        to_remove = [(a, b) for a, b in dists if a in (i, j) or b in (i, j)]
+        for key in to_remove:
+            del dists[key]
+        del clusters[i]
+        del clusters[j]
+
+        dists.update(new_dists)
+        clusters[next_id] = new_name
+        next_id += 1
+
+    newick = list(newick_parts.values())[-1] + ";"
+
+    out_path = args.output or "reports/guide_tree.nwk"
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+    with open(out_path, "w") as f:
+        f.write(newick + "\n")
+
+    print(f"Guide tree saved to {out_path} (Newick format)")
+    print(f"Use this tree with ClustalW/MUSCLE for embedding-guided MSA")
+
+
+def cmd_model_card(args):
+    """Generate model card in HuggingFace format (T142)."""
+    import torch, json
+
+    ckpt_path = args.checkpoint
+    if not os.path.exists(ckpt_path):
+        print(f"Error: checkpoint not found: {ckpt_path}", file=sys.stderr)
+        sys.exit(1)
+
+    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    model_cfg = ckpt.get("model_config", {})
+    run_info = ckpt.get("run_info", {})
+
+    # Load metrics if available
+    metrics = {}
+    metrics_path = "reports/metrics.json"
+    if os.path.exists(metrics_path):
+        with open(metrics_path) as f:
+            metrics = json.load(f)
+
+    model_type = model_cfg.get("model_type", "unknown")
+    task_type = model_cfg.get("task_type", "pretrain")
+    vocab_size = model_cfg.get("vocab_size", "?")
+    d_model = model_cfg.get("d_model", "?")
+    n_layers = model_cfg.get("n_layers", "?")
+    n_params = sum(p.numel() for p in torch.nn.Module.__new__(torch.nn.Module).__class__.__mro__[0].__dict__.items()) if False else "?"
+    try:
+        sys.path.insert(0, os.getcwd())
+        from train import build_model
+        m = build_model(**model_cfg)
+        n_params = sum(p.numel() for p in m.parameters())
+    except Exception:
+        n_params = "?"
+
+    card = f"""---
+language: en
+tags:
+- genomics
+- {model_type}
+- {task_type}
+- dna
+- biology
+library_name: pytorch
+---
+
+# Genomic {model_type.title()} Model
+
+## Model Description
+
+This is a **{model_type}** model trained for **{task_type}** on genomic (DNA/RNA) sequences
+using the [genomic-research](https://github.com/benrio0923/genomic-research) framework.
+
+### Architecture
+
+| Parameter | Value |
+|-----------|-------|
+| Model Type | {model_type} |
+| Hidden Dimension | {d_model} |
+| Layers | {n_layers} |
+| Vocab Size | {vocab_size} |
+| Parameters | {n_params:,} |
+| Task | {task_type} |
+
+### Training Details
+
+"""
+    if run_info:
+        for k, v in run_info.items():
+            card += f"- **{k}**: {v}\n"
+
+    if metrics:
+        card += "\n### Evaluation Results\n\n"
+        card += "| Metric | Value |\n|--------|-------|\n"
+        skip = {"predictions", "targets", "probabilities", "confusion_matrix",
+                "per_class", "run_info", "metric_direction"}
+        for k, v in metrics.items():
+            if k in skip or not isinstance(v, (int, float)):
+                continue
+            card += f"| {k} | {v:.4f} |\n"
+
+    card += """
+## Usage
+
+```python
+import torch
+from train import build_model
+
+checkpoint = torch.load("best_model.pt", map_location="cpu")
+model = build_model(**checkpoint["model_config"])
+model.load_state_dict(checkpoint["model_state_dict"])
+model.eval()
+```
+
+## Limitations
+
+- Trained on specific genomic data; may not generalize to all organisms
+- Performance depends on sequence similarity to training data
+- Tokenization must match training configuration
+
+## Framework
+
+Built with [genomic-research](https://github.com/benrio0923/genomic-research)
+"""
+
+    out_path = args.output or "MODEL_CARD.md"
+    with open(out_path, "w") as f:
+        f.write(card)
+    print(f"Model card saved to {out_path}")
+
+
 def cmd_compare(args):
     """Compare two experiment results (metrics.json files)."""
     import json
@@ -1117,6 +1458,30 @@ def main():
     p_motif.add_argument("--top-k", type=int, default=10, help="Number of top motifs to show")
     p_motif.add_argument("--window", type=int, default=8, help="Motif window size")
 
+    # align-score
+    p_align = subparsers.add_parser("align-score", help="Score pairwise similarity using model embeddings")
+    p_align.add_argument("--checkpoint", type=str, default="checkpoints/best_model.pt")
+    p_align.add_argument("--fasta", type=str, required=True, help="FASTA file with sequences to compare")
+    p_align.add_argument("--top-k", type=int, default=20, help="Show top-k similar pairs")
+
+    # mutation-rate
+    p_mut = subparsers.add_parser("mutation-rate", help="Estimate per-position mutation rates from model")
+    p_mut.add_argument("--checkpoint", type=str, default="checkpoints/best_model.pt")
+    p_mut.add_argument("--fasta", type=str, required=True, help="FASTA file")
+    p_mut.add_argument("--output", type=str, default=None, help="Output TSV path")
+    p_mut.add_argument("--max-seqs", type=int, default=5, help="Max sequences to analyze")
+
+    # msa-embed
+    p_msa = subparsers.add_parser("msa-embed", help="Build guide tree from model embeddings for MSA")
+    p_msa.add_argument("--checkpoint", type=str, default="checkpoints/best_model.pt")
+    p_msa.add_argument("--fasta", type=str, required=True, help="FASTA file")
+    p_msa.add_argument("--output", type=str, default=None, help="Output Newick tree path")
+
+    # model-card
+    p_card = subparsers.add_parser("model-card", help="Generate HuggingFace-format model card")
+    p_card.add_argument("--checkpoint", type=str, default="checkpoints/best_model.pt")
+    p_card.add_argument("--output", type=str, default=None, help="Output path (default: MODEL_CARD.md)")
+
     args = parser.parse_args()
 
     if args.command == "init":
@@ -1149,6 +1514,14 @@ def main():
         cmd_learning_curve(args)
     elif args.command == "motif-discovery":
         cmd_motif_discovery(args)
+    elif args.command == "align-score":
+        cmd_align_score(args)
+    elif args.command == "mutation-rate":
+        cmd_mutation_rate(args)
+    elif args.command == "msa-embed":
+        cmd_msa_embed(args)
+    elif args.command == "model-card":
+        cmd_model_card(args)
     else:
         parser.print_help()
 
