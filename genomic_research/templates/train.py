@@ -107,6 +107,9 @@ CNN_DILATION = _cfg("cnn_dilation", False)          # use exponential dilation i
 STOCHASTIC_DEPTH = _cfg("stochastic_depth", 0.0)   # layer drop probability (0.0 = disabled)
 USE_DEEPNORM = _cfg("use_deepnorm", False)         # DeepNorm for stable deep training
 NORM_POSITION = _cfg("norm_position", "pre")       # "pre" (Pre-LN, default) or "post" (Post-LN)
+USE_MOE = _cfg("use_moe", False)                   # replace FF layers with Mixture of Experts
+N_EXPERTS = _cfg("n_experts", 4)                   # number of expert FF networks
+MOE_TOP_K = _cfg("moe_top_k", 2)                  # top-k routing (how many experts per token)
 MAMBA_D_STATE = _cfg("mamba_d_state", 16)
 MAMBA_D_CONV = _cfg("mamba_d_conv", 4)
 MAMBA_EXPAND = _cfg("mamba_expand", 2)
@@ -525,11 +528,67 @@ class DropPath(nn.Module):
         return x * mask / keep_prob
 
 
+class MoEFeedForward(nn.Module):
+    """Mixture of Experts feed-forward layer with top-k routing."""
+
+    def __init__(self, d_model, d_ff, n_experts, top_k, dropout):
+        super().__init__()
+        self.n_experts = n_experts
+        self.top_k = min(top_k, n_experts)
+        self.gate = nn.Linear(d_model, n_experts, bias=False)
+        self.experts = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(d_model, d_ff),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(d_ff, d_model),
+                nn.Dropout(dropout),
+            )
+            for _ in range(n_experts)
+        ])
+        self.load_balance_loss = 0.0  # Set during forward pass
+
+    def forward(self, x):
+        # x: (B, L, D)
+        B, L, D = x.shape
+        x_flat = x.reshape(-1, D)  # (B*L, D)
+
+        # Gating
+        gate_logits = self.gate(x_flat)  # (B*L, n_experts)
+        gate_probs = torch.softmax(gate_logits, dim=-1)
+
+        # Top-k routing
+        top_k_vals, top_k_idx = torch.topk(gate_probs, self.top_k, dim=-1)
+        top_k_vals = top_k_vals / top_k_vals.sum(dim=-1, keepdim=True)  # Renormalize
+
+        # Expert load balancing loss (auxiliary)
+        # Fraction of tokens routed to each expert * importance of each expert
+        tokens_per_expert = torch.zeros(self.n_experts, device=x.device)
+        for i in range(self.n_experts):
+            tokens_per_expert[i] = (top_k_idx == i).float().sum()
+        tokens_per_expert = tokens_per_expert / (B * L)
+        importance = gate_probs.mean(dim=0)
+        self.load_balance_loss = float(self.n_experts * (tokens_per_expert * importance).sum())
+
+        # Compute expert outputs
+        out = torch.zeros_like(x_flat)
+        for k in range(self.top_k):
+            expert_idx = top_k_idx[:, k]  # (B*L,)
+            weight = top_k_vals[:, k].unsqueeze(-1)  # (B*L, 1)
+            for i in range(self.n_experts):
+                mask = expert_idx == i
+                if mask.any():
+                    out[mask] += weight[mask] * self.experts[i](x_flat[mask])
+
+        return out.reshape(B, L, D)
+
+
 class GenomicTransformerLayer(nn.Module):
     """Custom Transformer layer supporting RoPE/ALiBi."""
 
     def __init__(self, d_model, n_heads, d_ff, dropout, pos_type="sinusoidal",
-                 drop_path=0.0, deepnorm_alpha=1.0, norm_position="pre"):
+                 drop_path=0.0, deepnorm_alpha=1.0, norm_position="pre",
+                 use_moe=False, n_experts=4, moe_top_k=2):
         super().__init__()
         self.pos_type = pos_type
         self.n_heads = n_heads
@@ -545,13 +604,18 @@ class GenomicTransformerLayer(nn.Module):
         self.v_proj = nn.Linear(d_model, d_model)
         self.out_proj = nn.Linear(d_model, d_model)
 
-        self.ff = nn.Sequential(
-            nn.Linear(d_model, d_ff),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(d_ff, d_model),
-            nn.Dropout(dropout),
-        )
+        if use_moe and n_experts > 1:
+            self.ff = MoEFeedForward(d_model, d_ff, n_experts, moe_top_k, dropout)
+            self.use_moe = True
+        else:
+            self.ff = nn.Sequential(
+                nn.Linear(d_model, d_ff),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(d_ff, d_model),
+                nn.Dropout(dropout),
+            )
+            self.use_moe = False
         self.attn_dropout = nn.Dropout(dropout)
         self.ff_dropout = nn.Dropout(dropout)
         self.drop_path = DropPath(drop_path) if drop_path > 0 else nn.Identity()
@@ -625,7 +689,8 @@ class GenomicTransformer(nn.Module):
 
     def __init__(self, vocab_size, d_model, n_heads, d_ff, n_layers, max_len, dropout,
                  task_type, n_classes=None, pos_encoding="sinusoidal",
-                 stochastic_depth=0.0, use_deepnorm=False, norm_position="pre"):
+                 stochastic_depth=0.0, use_deepnorm=False, norm_position="pre",
+                 use_moe=False, n_experts=4, moe_top_k=2):
         super().__init__()
         self.task_type = task_type
         self.d_model = d_model
@@ -663,7 +728,9 @@ class GenomicTransformer(nn.Module):
                 GenomicTransformerLayer(d_model, n_heads, d_ff, dropout, pos_encoding,
                                        drop_path=_dp_rates[i],
                                        deepnorm_alpha=self._deepnorm_alpha,
-                                       norm_position=norm_position)
+                                       norm_position=norm_position,
+                                       use_moe=use_moe, n_experts=n_experts,
+                                       moe_top_k=moe_top_k)
                 for i in range(n_layers)
             ])
         else:
@@ -816,6 +883,86 @@ class GenomicCNN(nn.Module):
             if attention_mask is not None:
                 mask_expanded = attention_mask.unsqueeze(-1).float()
                 x = (x * mask_expanded).sum(dim=1) / mask_expanded.sum(dim=1).clamp(min=1)
+            else:
+                x = x.mean(dim=1)
+            return self.head(x)
+
+
+# ---------------------------------------------------------------------------
+# Convolutional Transformer (hybrid)
+# ---------------------------------------------------------------------------
+
+class GenomicConvTransformer(nn.Module):
+    """Hybrid: Conv1d layers for local features, then Transformer for global context."""
+
+    def __init__(self, vocab_size, d_model, n_heads, d_ff, n_layers, max_len, dropout,
+                 task_type, n_classes=None, n_conv_layers=2, kernel_size=7):
+        super().__init__()
+        self.task_type = task_type
+        self.d_model = d_model
+        n_conv_layers = min(n_conv_layers, n_layers - 1)  # At least 1 Transformer layer
+
+        self.embedding = nn.Embedding(vocab_size, d_model, padding_idx=PAD_TOKEN_ID)
+        self.emb_dropout = nn.Dropout(dropout)
+
+        # Conv layers for local feature extraction
+        self.conv_layers = nn.ModuleList()
+        for i in range(n_conv_layers):
+            pad = kernel_size // 2
+            self.conv_layers.append(nn.Sequential(
+                nn.Conv1d(d_model, d_model, kernel_size, padding=pad),
+                nn.BatchNorm1d(d_model),
+                nn.GELU(),
+                nn.Dropout(dropout),
+            ))
+
+        # Transformer layers for global context
+        n_transformer = n_layers - n_conv_layers
+        self.pos_encoding = PositionalEncoding(d_model, max_len=max_len, dropout=dropout)
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model, nhead=n_heads, dim_feedforward=d_ff,
+            dropout=dropout, activation="gelu", batch_first=True, norm_first=True,
+        )
+        self.encoder = nn.TransformerEncoder(
+            encoder_layer, num_layers=n_transformer, enable_nested_tensor=False,
+        )
+        self.ln = nn.LayerNorm(d_model)
+
+        if task_type == "pretrain":
+            self.head = nn.Linear(d_model, vocab_size)
+        elif task_type == "classify":
+            self.head = nn.Sequential(
+                nn.Linear(d_model, d_model), nn.GELU(), nn.Dropout(dropout),
+                nn.Linear(d_model, n_classes),
+            )
+        elif task_type == "regress":
+            self.head = nn.Sequential(
+                nn.Linear(d_model, d_model), nn.GELU(), nn.Dropout(dropout),
+                nn.Linear(d_model, 1),
+            )
+
+    def forward(self, input_ids, attention_mask=None):
+        x = self.embedding(input_ids)  # (B, L, D)
+        x = self.emb_dropout(x)
+
+        # Conv layers (B, L, D) → (B, D, L) → conv → (B, L, D)
+        h = x.transpose(1, 2)
+        for conv in self.conv_layers:
+            h = conv(h) + h  # residual
+        x = h.transpose(1, 2)
+
+        # Positional encoding + Transformer
+        x = self.pos_encoding(x)
+        src_key_padding_mask = (attention_mask == 0) if attention_mask is not None else None
+        x = self.encoder(x, src_key_padding_mask=src_key_padding_mask)
+        x = self.ln(x)
+
+        if self.task_type == "pretrain":
+            return self.head(x)
+        else:
+            if attention_mask is not None:
+                mask_exp = attention_mask.unsqueeze(-1).float()
+                x = (x * mask_exp).sum(dim=1) / mask_exp.sum(dim=1).clamp(min=1)
             else:
                 x = x.mean(dim=1)
             return self.head(x)
@@ -1024,6 +1171,7 @@ def build_model(model_type, vocab_size, d_model, n_heads, d_ff, n_layers,
             stochastic_depth=STOCHASTIC_DEPTH,
             use_deepnorm=USE_DEEPNORM,
             norm_position=NORM_POSITION,
+            use_moe=USE_MOE, n_experts=N_EXPERTS, moe_top_k=MOE_TOP_K,
         )
     elif model_type == "cnn":
         model = GenomicCNN(
@@ -1039,6 +1187,12 @@ def build_model(model_type, vocab_size, d_model, n_heads, d_ff, n_layers,
             n_classes=n_classes, bidirectional=LSTM_BIDIRECTIONAL,
             rnn_type="gru" if model_type == "gru" else RNN_TYPE,
         )
+    elif model_type == "conv_transformer":
+        model = GenomicConvTransformer(
+            vocab_size=vocab_size, d_model=d_model, n_heads=n_heads, d_ff=d_ff,
+            n_layers=n_layers, max_len=max_len, dropout=dropout,
+            task_type=task_type, n_classes=n_classes,
+        )
     elif model_type == "mamba":
         model = GenomicMamba(
             vocab_size=vocab_size, d_model=d_model, n_layers=n_layers, d_ff=d_ff,
@@ -1047,7 +1201,7 @@ def build_model(model_type, vocab_size, d_model, n_heads, d_ff, n_layers,
             expand=MAMBA_EXPAND,
         )
     else:
-        raise ValueError(f"Unknown model type: {model_type}. Use: transformer, cnn, lstm, gru, mamba")
+        raise ValueError(f"Unknown model type: {model_type}. Use: transformer, cnn, lstm, gru, conv_transformer, mamba")
 
     # Apply proper weight initialization
     model.apply(lambda m: _init_weights(m, d_model))

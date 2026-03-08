@@ -44,6 +44,12 @@ MODEL_ARCHITECTURES = {
         "pros": "Sequential modeling, moderate complexity",
         "cons": "Slower training, gradient issues on very long sequences",
     },
+    "conv_transformer": {
+        "description": "Convolutional Transformer (hybrid)",
+        "params": "d_model, n_heads, d_ff, n_layers, n_conv_layers",
+        "pros": "Conv captures local patterns, Transformer adds global context",
+        "cons": "More complex architecture, slightly more parameters",
+    },
 }
 
 
@@ -539,6 +545,86 @@ def cmd_embed(args):
     print(f"Embeddings saved to {output_path} — shape: {embeddings.shape}")
 
 
+def cmd_export(args):
+    """Export a trained model to TorchScript or ONNX format."""
+    import torch
+
+    ckpt_path = args.checkpoint
+    if not os.path.exists(ckpt_path):
+        print(f"Error: checkpoint not found: {ckpt_path}", file=sys.stderr)
+        sys.exit(1)
+
+    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    model_config = ckpt.get("model_config", {})
+
+    cwd = Path.cwd()
+    for f in ["prepare.py", "train.py"]:
+        if not (cwd / f).exists():
+            shutil.copy2(TEMPLATES_DIR / f, cwd / f)
+
+    sys.path.insert(0, str(cwd))
+    from train import build_model
+
+    model = build_model(**model_config)
+    model.load_state_dict(ckpt["model_state_dict"])
+    model.eval()
+
+    fmt = args.format
+    seq_len = model_config.get("max_length", 512)
+
+    # Dummy input for tracing
+    dummy_tokens = torch.randint(5, 100, (1, seq_len))
+    dummy_mask = torch.ones(1, seq_len, dtype=torch.bool)
+
+    if fmt == "torchscript":
+        output_path = args.output or "model.pt"
+        try:
+            traced = torch.jit.trace(model, (dummy_tokens, dummy_mask))
+            traced.save(output_path)
+            print(f"TorchScript model saved to {output_path}")
+        except Exception as e:
+            print(f"TorchScript trace failed: {e}", file=sys.stderr)
+            print("Trying torch.jit.script instead...")
+            try:
+                scripted = torch.jit.script(model)
+                scripted.save(output_path)
+                print(f"TorchScript (scripted) model saved to {output_path}")
+            except Exception as e2:
+                print(f"TorchScript script also failed: {e2}", file=sys.stderr)
+                sys.exit(1)
+
+    elif fmt == "onnx":
+        output_path = args.output or "model.onnx"
+        try:
+            torch.onnx.export(
+                model, (dummy_tokens, dummy_mask), output_path,
+                input_names=["tokens", "attention_mask"],
+                output_names=["output"],
+                dynamic_axes={
+                    "tokens": {0: "batch", 1: "seq_len"},
+                    "attention_mask": {0: "batch", 1: "seq_len"},
+                    "output": {0: "batch"},
+                },
+                opset_version=14,
+            )
+            print(f"ONNX model saved to {output_path}")
+        except Exception as e:
+            print(f"ONNX export failed: {e}", file=sys.stderr)
+            print("Hint: pip install onnx onnxruntime")
+            sys.exit(1)
+    else:
+        print(f"Unsupported format: {fmt}", file=sys.stderr)
+        sys.exit(1)
+
+    # Print export info
+    file_size = os.path.getsize(output_path) / (1024 * 1024)
+    total_params = sum(p.numel() for p in model.parameters())
+    print(f"  Format:     {fmt}")
+    print(f"  File size:  {file_size:.1f} MB")
+    print(f"  Parameters: {total_params:,}")
+    print(f"  Input:      tokens[batch, {seq_len}] + mask[batch, {seq_len}]")
+
+
 def cmd_compare(args):
     """Compare two experiment results (metrics.json files)."""
     import json
@@ -658,6 +744,14 @@ def main():
     p_embed.add_argument("--seq-col", type=str, default=None, help="Sequence column name (CSV)")
     p_embed.add_argument("--output", type=str, default="embeddings.npy", help="Output file (.npy)")
 
+    # export
+    p_export = subparsers.add_parser("export", help="Export model to TorchScript or ONNX")
+    p_export.add_argument("--checkpoint", type=str, required=True, help="Path to model checkpoint (.pt)")
+    p_export.add_argument("--format", type=str, default="torchscript",
+                          choices=["torchscript", "onnx"],
+                          help="Export format (default: torchscript)")
+    p_export.add_argument("--output", type=str, default=None, help="Output file path")
+
     # compare
     p_compare = subparsers.add_parser("compare", help="Compare two experiment results")
     p_compare.add_argument("file1", type=str, help="First metrics.json file")
@@ -685,6 +779,8 @@ def main():
         cmd_embed(args)
     elif args.command == "compare":
         cmd_compare(args)
+    elif args.command == "export":
+        cmd_export(args)
     else:
         parser.print_help()
 
